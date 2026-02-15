@@ -31,7 +31,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-overlay", action="store_true", help="Disable overlay.")
     p.add_argument("--memory", default=os.getenv("AIK_MEMORY_PATH", ".aik_memory.json"), help="Path to local agent memory JSON.")
     p.add_argument("--learning", default=os.getenv("AIK_LEARNING_PATH", ".aik_learning.json"), help="Path to learning graph JSON.")
+    p.add_argument("--history", default=os.getenv("AIK_HISTORY_PATH", ".aik_history.json"), help="Path to detailed session history JSON.")
     p.add_argument("--no-driver", action="store_true", help="Disable kernel-driver injection (use SendInput only).")
+    p.add_argument("--max-actions-per-step", type=int, default=6, help="Max actions to execute per API call (reduces API calls).")
+    p.add_argument("--no-api-throttle", action="store_true", help="Disable API throttling on stale screen.")
     return p.parse_args(argv)
 
 
@@ -63,7 +66,10 @@ def main(argv: list[str]) -> int:
         temperature=args.temperature,
         memory_path=args.memory,
         learning_path=args.learning,
+        history_path=args.history,
         use_driver=not args.no_driver,
+        max_actions_per_step=args.max_actions_per_step,
+        api_throttle_on_stale=not args.no_api_throttle,
     )
 
     enable_overlay = bool(args.overlay) or (not bool(args.no_overlay))

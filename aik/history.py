@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -46,6 +48,12 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _new_session_id() -> str:
+    # Timestamp prefix keeps sessions lexicographically sortable and human-readable.
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{ts}-{uuid.uuid4().hex[:8]}"
+
+
 def _action_signature(action: dict) -> str:
     action_type = str(action.get("type", "")).lower()
     if action_type == "type_text":
@@ -73,12 +81,22 @@ def _contains_any(text: str, needles: list[str]) -> bool:
 
 
 class ConversationHistory:
-    def __init__(self, goal: str, *, keep_recent_steps: int = 6) -> None:
+    def __init__(self, goal: str, *, keep_recent_steps: int = 6, history_path: str | None = None) -> None:
         self.goal = goal
         self.keep_recent_steps = max(2, keep_recent_steps)
+        self.history_path = history_path
+
+        # Each run gets its own session record in the history file so history isn't overwritten.
+        self.session_id = _new_session_id()
+        self.started_at_utc = _utc_now_iso()
+        self._previous_sessions: list[dict] = self._load_previous_sessions()
+
         self._task_message = self._build_initial_task_message(goal)
         self._steps: list[StepMemory] = []
         self._progress = ProgressChecklist(tasks=self._infer_subtasks(goal))
+
+        # Create the file early so the session exists even if we crash before step 1.
+        self.save()
 
     @property
     def steps(self) -> list[StepMemory]:
@@ -234,6 +252,98 @@ class ConversationHistory:
         )
         self._steps.append(memory)
         self._update_progress(memory)
+        self.save()
+
+    def save(self) -> None:
+        if not self.history_path:
+            return
+        
+        try:
+            # We don't save the full screenshots to the JSON history (too large), 
+            # just the text metadata.
+            session = {
+                "session_id": self.session_id,
+                "goal": self.goal,
+                "started_at_utc": self.started_at_utc,
+                "updated_at_utc": _utc_now_iso(),
+                "steps": [
+                    {
+                        "step": s.step,
+                        "observed": s.observed,
+                        "planned_actions": s.planned_actions,
+                        "executed_actions": [
+                            {
+                                "action": r.action,
+                                "success": r.success,
+                                "error": r.error,
+                                "duration_ms": r.duration_ms,
+                                "timestamp": r.timestamp_utc,
+                            }
+                            for r in s.executed_actions
+                        ],
+                        "success": s.success,
+                        "timestamp": s.timestamp_utc,
+                    }
+                    for s in self._steps
+                ],
+                "progress": {
+                    "tasks": self._progress.tasks,
+                    "completed": list(self._progress.completed),
+                }
+            }
+
+            data = {
+                "version": 2,
+                "sessions": [*self._previous_sessions, session],
+            }
+            
+            os.makedirs(os.path.dirname(self.history_path) or ".", exist_ok=True)
+            tmp = self.history_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.history_path)
+        except Exception:
+            # Soft failure for history saving
+            pass
+
+    def _load_previous_sessions(self) -> list[dict]:
+        """Load prior sessions from history_path (supports legacy single-session format)."""
+        path = self.history_path
+        if not path or not os.path.exists(path):
+            return []
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            # Don't destroy a possibly useful history file; move it aside and start fresh.
+            try:
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                os.replace(path, f"{path}.corrupt.{ts}")
+            except Exception:
+                pass
+            return []
+
+        # New multi-session format.
+        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+            sessions = [s for s in data.get("sessions", []) if isinstance(s, dict)]
+            return sessions
+
+        # Legacy single-session format (older AIK versions).
+        if isinstance(data, dict) and ("goal" in data) and isinstance(data.get("steps"), list):
+            legacy_ts = str(data.get("timestamp_utc") or _utc_now_iso())
+            legacy = {
+                "session_id": f"legacy-{legacy_ts}",
+                "goal": str(data.get("goal") or ""),
+                "started_at_utc": legacy_ts,
+                "updated_at_utc": legacy_ts,
+                "steps": data.get("steps", []),
+                "progress": data.get("progress", {}),
+                "legacy_format": True,
+            }
+            return [legacy]
+
+        return []
 
     def _update_progress(self, memory: StepMemory) -> None:
         joined = " ".join(

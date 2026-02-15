@@ -54,7 +54,10 @@ class AgentConfig:
     inter_key_delay_s: float = 0.01
     memory_path: str = ".aik_memory.json"
     learning_path: str = ".aik_learning.json"
+    history_path: str = ".aik_history.json"
     use_driver: bool = True  # try kernel driver, fall back to SendInput
+    max_actions_per_step: int = 6  # actions to execute per API call (reduces API calls)
+    api_throttle_on_stale: bool = True  # skip API call if screen unchanged and actions pending
 
 
 @dataclass
@@ -62,6 +65,7 @@ class AgentState:
     recent_actions: list[dict] = field(default_factory=list)
     human_notes: list[str] = field(default_factory=list)
     recent_plan_sigs: list[str] = field(default_factory=list)
+    pending_actions: list[dict] = field(default_factory=list)  # actions from previous plan not yet executed
 
 
 # ── agent ────────────────────────────────────────────────────────────────────
@@ -90,7 +94,7 @@ class KeyboardVisionAgent:
         self._last_shot_height = 0
         self._memory = Memory.load(cfg.memory_path)
         self._learning = LearningGraph.load(cfg.learning_path)
-        self._history = ConversationHistory(cfg.goal)
+        self._history = ConversationHistory(cfg.goal, history_path=cfg.history_path)
 
         # Screenshot-change detection
         self._prev_screen_hash: str | None = None
@@ -127,6 +131,11 @@ class KeyboardVisionAgent:
         )
         log.info("Kill switch: Ctrl+Alt+Backspace")
 
+        # Record start
+        self._memory.append_event({
+            "type": "run_start", "goal": self._cfg.goal, "ts": int(time.time())
+        })
+
         try:
             self._loop()
         finally:
@@ -140,6 +149,9 @@ class KeyboardVisionAgent:
             # 0. Kill switch
             if self._kill.triggered:
                 log.warning("Kill switch triggered. Stopping.")
+                self._memory.append_event({
+                    "type": "run_stop", "reason": "kill_switch", "goal": self._cfg.goal, "ts": int(time.time())
+                })
                 return
 
             # 1. Focus the target app (best-effort)
@@ -156,6 +168,29 @@ class KeyboardVisionAgent:
 
             # 3. Detect whether screen changed since last step
             screen_changed = self._did_screen_change(shot)
+
+            # ─── API Throttle: skip API call if actions pending and screen unchanged ───
+            if (self._cfg.api_throttle_on_stale 
+                and not screen_changed 
+                and self._state.pending_actions
+                and self._stale_count < 2):
+                # Screen hasn't changed and we have pending actions - retry them first
+                # instead of making another expensive API call
+                log.info("Throttling API: retrying pending actions (%d) - screen unchanged", 
+                         len(self._state.pending_actions))
+                # Re-execute pending actions with explicit retry instruction
+                retry_actions = list(self._state.pending_actions)
+                retry_plan = ParsedPlan(
+                    actions=retry_actions,
+                    meta={"observation": "Screen unchanged - retrying last action", "retry": True}
+                )
+                if self._execute_plan(retry_plan, shot, active_window_title="", active_process_path=None):
+                    return
+                # If still failed, clear pending and continue to get new plan
+                self._state.pending_actions.clear()
+                time.sleep(0.5)
+                # Continue to get new plan from API
+            # ────────────────────────────────────────────────────────────────────────
 
             if not screen_changed and self._state.recent_actions:
                 self._stale_count += 1
@@ -272,6 +307,17 @@ class KeyboardVisionAgent:
 
         log.warning("Max steps reached (%d). Stopping.", self._cfg.max_steps)
         self._update_overlay_simple("max steps reached")
+        
+        # Record failure for learning
+        self._learning.record_failure(
+            app=_detect_app_from_goal(self._cfg.goal),
+            goal=self._cfg.goal,
+            action={"type": "timeout"},
+            reason=f"Reached max_steps ({self._cfg.max_steps}) without completion",
+        )
+        self._memory.append_event({
+            "type": "run_stop", "reason": "timeout", "goal": self._cfg.goal, "ts": int(time.time())
+        })
 
     # ── VLM call ─────────────────────────────────────────────────────────
 
@@ -326,7 +372,7 @@ class KeyboardVisionAgent:
         active_process_path: str | None,
     ) -> bool:
         """Execute actions.  Returns True if "stop" was reached."""
-        actions = plan.actions[:6]
+        actions = plan.actions[:self._cfg.max_actions_per_step]
         log.info("Plan (%d actions): %s", len(actions), actions)
 
         step = self._current_step
@@ -471,6 +517,22 @@ class KeyboardVisionAgent:
             )
         except Exception as exc:
             log.debug("Failed to append history step: %s", exc)
+
+        # Track pending actions: actions not executed due to failure, or all if success but more remain
+        executed_count = len(executed)
+        remaining_actions = actions[executed_count:]
+        
+        # If step succeeded but there are more actions in original plan, keep them for retry
+        if step_success and remaining_actions:
+            self._state.pending_actions = remaining_actions
+            log.info("Stored %d pending actions for retry", len(remaining_actions))
+        elif not step_success and executed_count > 0:
+            # On failure, retry the failed action
+            self._state.pending_actions = [actions[executed_count - 1]] if executed_count > 0 else []
+            log.info("Stored %d pending actions after failure", len(self._state.pending_actions))
+        else:
+            # Clear pending if nothing to retry
+            self._state.pending_actions.clear()
 
         if ask_user_break:
             return False
