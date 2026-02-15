@@ -4,4 +4,6 @@ __pycache__/
 .env
 .aik_memory.json
 .aik_learning.json
+.aik_history.jsonl
+.aik_runs/
 

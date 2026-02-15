@@ -31,6 +31,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-overlay", action="store_true", help="Disable overlay.")
     p.add_argument("--memory", default=os.getenv("AIK_MEMORY_PATH", ".aik_memory.json"), help="Path to local agent memory JSON.")
     p.add_argument("--learning", default=os.getenv("AIK_LEARNING_PATH", ".aik_learning.json"), help="Path to learning graph JSON.")
+    p.add_argument("--history-log", default=os.getenv("AIK_HISTORY_LOG", ".aik_history.jsonl"), help="Append-only JSONL history log path (actions/steps).")
     p.add_argument("--no-driver", action="store_true", help="Disable kernel-driver injection (use SendInput only).")
     return p.parse_args(argv)
 
@@ -63,6 +64,7 @@ def main(argv: list[str]) -> int:
         temperature=args.temperature,
         memory_path=args.memory,
         learning_path=args.learning,
+        history_log_path=args.history_log,
         use_driver=not args.no_driver,
     )
 

@@ -4,6 +4,7 @@ import base64
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import os
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,11 @@ class ConversationHistory:
         self._task_message = self._build_initial_task_message(goal)
         self._steps: list[StepMemory] = []
         self._progress = ProgressChecklist(tasks=self._infer_subtasks(goal))
+        self._session_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
 
     @property
     def steps(self) -> list[StepMemory]:
@@ -222,7 +228,7 @@ class ConversationHistory:
         executed_actions: list[ActionExecutionRecord],
         success: bool,
         screenshot_png: bytes,
-    ) -> None:
+    ) -> StepMemory:
         memory = StepMemory(
             step=step,
             observed=observed,
@@ -234,6 +240,37 @@ class ConversationHistory:
         )
         self._steps.append(memory)
         self._update_progress(memory)
+        return memory
+
+    def persist_step_jsonl(self, *, path: str, memory: StepMemory) -> None:
+        """Append a compact step record to a JSONL file.
+
+        This is intended for debugging/auditing. It does NOT store screenshots.
+        """
+
+        event = {
+            "type": "step",
+            "session_id": self._session_id,
+            "goal": self.goal,
+            "step": memory.step,
+            "timestamp_utc": memory.timestamp_utc,
+            "observed": memory.observed,
+            "planned_actions": memory.planned_actions,
+            "executed_actions": [
+                {
+                    "action": rec.action,
+                    "success": rec.success,
+                    "duration_ms": rec.duration_ms,
+                    "error": rec.error,
+                    "timestamp_utc": rec.timestamp_utc,
+                }
+                for rec in memory.executed_actions
+            ],
+            "step_success": memory.success,
+            "checklist": self._progress.render(),
+        }
+
+        _append_jsonl(path, event)
 
     def _update_progress(self, memory: StepMemory) -> None:
         joined = " ".join(
@@ -331,3 +368,10 @@ class ConversationHistory:
                 "data": b64,
             },
         }
+
+
+def _append_jsonl(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    line = json.dumps(obj, ensure_ascii=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")

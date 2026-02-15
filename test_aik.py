@@ -41,6 +41,18 @@ def test_history_memory():
         assert messages[0]["role"] == "user"
         print("✓ ConversationHistory builds messages")
         print(f"  Messages count: {len(messages)}")
+
+        # Ensure append_step returns a StepMemory
+        mem = hist.append_step(
+            step=1,
+            observed="ok",
+            planned_actions=[{"type": "stop", "reason": "done"}],
+            executed_actions=[],
+            success=True,
+            screenshot_png=b"",
+        )
+        assert getattr(mem, "step", None) == 1
+        print("✓ ConversationHistory.append_step returns StepMemory")
         return True
     except Exception as e:
         print(f"✗ History/memory failed: {e}")
