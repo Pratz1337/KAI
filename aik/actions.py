@@ -12,6 +12,8 @@ class ActionParseError(ValueError):
 @dataclass(frozen=True)
 class ParsedPlan:
     actions: list[dict[str, Any]]
+    reasoning: str = ""
+    expected_outcome: str = ""
 
 
 ALLOWED_ACTION_TYPES = {"type_text", "key_press", "hotkey", "wait_ms", "stop"}
@@ -37,7 +39,10 @@ def parse_plan(text: str) -> ParsedPlan:
             raise ActionParseError(f"Action #{i} has unsupported type: {t!r}")
         parsed.append(_normalize_action({**a, "type": t}, i))
 
-    return ParsedPlan(actions=parsed)
+    reasoning = str(obj.get("reasoning", "") or "")
+    expected = str(obj.get("expected_outcome", "") or "")
+
+    return ParsedPlan(actions=parsed, reasoning=reasoning, expected_outcome=expected)
 
 
 def _normalize_action(a: dict[str, Any], idx: int) -> dict[str, Any]:
@@ -103,21 +108,45 @@ def _loads_first_json_object(text: str) -> Any:
     if not s:
         raise ActionParseError("Empty model response.")
 
-    # Fast path.
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
+    # Robust path: parse the first JSON value (dict) even if there's trailing text,
+    # multiple JSON objects, or leading chatter. This avoids json.loads() "Extra data".
+    dec = json.JSONDecoder()
 
-    # Common failure mode: model prints extra text around the JSON.
+    starts: list[int] = []
+    # First non-space position.
+    lstripped = s.lstrip()
+    if lstripped:
+        starts.append(len(s) - len(lstripped))
+    # Any '{' in the string (common when the model prints "Here is the JSON: {...}").
+    starts.extend(i for i, ch in enumerate(s) if ch == "{")
+
+    seen: set[int] = set()
+    starts_unique: list[int] = []
+    for i in starts:
+        if i in seen:
+            continue
+        seen.add(i)
+        starts_unique.append(i)
+
+    last_err: Exception | None = None
+    for i in starts_unique:
+        try:
+            obj, _end = dec.raw_decode(s, i)
+        except Exception as e:
+            last_err = e
+            continue
+        if isinstance(obj, dict):
+            return obj
+
+    # Fallback: attempt to parse a brace-bounded substring (best-effort).
     start = s.find("{")
     end = s.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ActionParseError("Could not find a JSON object in the model response.")
+    if start != -1 and end != -1 and end > start:
+        candidate = s[start : end + 1]
+        try:
+            obj = json.loads(candidate)
+            return obj
+        except Exception as e:
+            last_err = e
 
-    candidate = s[start : end + 1]
-    try:
-        return json.loads(candidate)
-    except Exception as e:
-        raise ActionParseError(f"Failed to parse JSON: {e}") from e
-
+    raise ActionParseError(f"Failed to parse JSON: {last_err}") from last_err

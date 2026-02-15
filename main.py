@@ -27,7 +27,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Exit with an error if not running as Administrator.",
     )
     p.add_argument("--max-steps", type=int, default=40)
-    p.add_argument("--interval", type=float, default=0.8, help="Seconds between planning cycles.")
+    p.add_argument("--interval", type=float, default=1.5, help="Seconds between planning cycles.")
     p.add_argument("--monitor", type=int, default=1, help="mss monitor index (1=primary).")
     p.add_argument("--screenshot-max-width", type=int, default=1280)
     p.add_argument("--max-tokens", type=int, default=700)
@@ -35,6 +35,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--model", default=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"))
     p.add_argument("--base-url", default=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
     p.add_argument("--anthropic-version", default=os.getenv("ANTHROPIC_VERSION", "2023-06-01"))
+    p.add_argument(
+        "--min-api-interval",
+        type=float,
+        default=float(os.getenv("AIK_MIN_API_INTERVAL", "1.5")),
+        help="Minimum seconds between Anthropic API requests (helps avoid rate limits).",
+    )
+    p.add_argument(
+        "--api-retries",
+        type=int,
+        default=int(os.getenv("AIK_API_RETRIES", "4")),
+        help="Retries for transient Anthropic API errors (429/529/5xx).",
+    )
     p.add_argument("--log-level", default=os.getenv("AIK_LOG_LEVEL", "INFO"))
     p.add_argument(
         "--kernel",
@@ -45,6 +57,38 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--driver-path",
         default=os.getenv("AIK_DRIVER_PATH", r"\\.\AikKmdfIoctl"),
         help="Device path for the kernel driver.",
+    )
+    p.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Disable vision-based goal verification (not recommended; may cause false 'success').",
+    )
+    p.add_argument(
+        "--verify-threshold",
+        type=float,
+        default=0.8,
+        help="Confidence threshold (0..1) required to accept a verified stop.",
+    )
+    p.add_argument(
+        "--no-decompose",
+        action="store_true",
+        help="Disable automatic goal decomposition into verifiable stages.",
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable detailed per-step logging with action descriptions and post-action diagnostics.",
+    )
+    p.add_argument(
+        "--history-limit",
+        type=int,
+        default=60,
+        help="Max number of conversation turns to keep in context (default: 60).",
+    )
+    p.add_argument(
+        "--no-verify-steps",
+        action="store_true",
+        help="Disable micro-verification of every action (verification is ON by default).",
     )
     return p.parse_args(argv)
 
@@ -83,6 +127,8 @@ def main(argv: list[str]) -> int:
         model=args.model,
         base_url=args.base_url,
         anthropic_version=args.anthropic_version,
+        max_retries=args.api_retries,
+        min_interval_s=float(args.min_api_interval),
     )
 
     cfg = AgentConfig(
@@ -96,6 +142,12 @@ def main(argv: list[str]) -> int:
         temperature=args.temperature,
         kernel_mode=args.kernel,
         driver_path=args.driver_path,
+        verify_goal_on_stop=not args.no_verify,
+        verify_confidence_threshold=float(args.verify_threshold),
+        use_goal_decomposition=not args.no_decompose,
+        verbose_logging=args.verbose,
+        max_conversation_turns=args.history_limit,
+        verify_steps=not args.no_verify_steps,
     )
 
     agent = KeyboardVisionAgent(cfg, anthropic=client, kill_switch=KillSwitch())

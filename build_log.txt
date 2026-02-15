@@ -1,0 +1,56 @@
+﻿MSBuild version 18.3.0-release-26070-10+3972042b7 for .NET Framework
+Build started 2/15/2026 2:25:30 PM.
+
+Project "c:\Users\sayal\OneDrive\Desktop\AIK\driver_stub\AikKmdfIoctl\AikKmdfIoctl.vcxproj" on node 1 (Rebuild target(s)).
+_PrepareForClean:
+  Deleting file "x64\Debug\obj\AikKmdfIoctl.tlog\AikKmdfIoctl.lastbuildstate".
+CleanOutput:
+  Deleting file "x64\Debug\obj\AikKmdfIoctl.tlog\unsuccessfulbuild".
+  Deleting file "x64\Debug\obj\AikKmdfIoctl.vcxproj.FileListAbsolute.txt".
+  Removing directory "x64\Debug\obj\AikKmdfIoctl.tlog\".
+DriverBuildNotifications:
+  Building 'AikKmdfIoctl' with toolset 'WindowsKernelModeDriver10.0' and the 'Desktop' target platform.
+  Using KMDF 1.15.
+PrepareForBuild:
+  Structured output is enabled. The formatting of compiler diagnostics will reflect the error hierarchy. See https://aka.ms/cpp/structured-output for more details.
+  Creating directory "x64\Debug\obj\AikKmdfIoctl.tlog\".
+InitializeBuildStatus:
+  Creating "x64\Debug\obj\AikKmdfIoctl.tlog\unsuccessfulbuild" because "AlwaysCreate" was specified.
+  Touching "x64\Debug\obj\AikKmdfIoctl.tlog\unsuccessfulbuild".
+ClCompile:
+  C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\HostX86\x64\CL.exe /c /Ix64\Debug\obj\ /Zi /nologo /W4 /WX- /diagnostics:column /Od /Oi /Oy- /D _DEBUG /D _WIN64 /D _AMD64_ /D AMD64 /D DEPRECATE_DDK_FUNCTIONS=1 /D MSC_NOOPT /D _WIN32_WINNT=0x0A00 /D WINVER=0x0A00 /D WINNT=1 /D NTDDI_VERSION=0xA000010 /D DBG=1 /D KMDF_VERSION_MAJOR=1 /D KMDF_VERSION_MINOR=15 /GF /Gm- /Zp8 /GS /guard:cf /Gy /fp:precise /Zc:wchar_t- /Zc:forScope /Zc:inline /GR- /Fo"x64\Debug\obj\\" /Fd"x64\Debug\obj\vc145.pdb" /external:W4 /Gz /wd4748 /wd4603 /wd4627 /wd4986 /wd4987 /FI"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared\warning.h" /FC /errorReport:queue /kernel -cbstring -d2epilogunwind /d1import_no_registry /d2AllowCompatibleILVersions /d2Zi+ Driver.c Device.c Queue.c
+  Driver.c
+  Device.c
+  Queue.c
+  Generating Code...
+Link:
+  C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\HostX86\x64\link.exe /ERRORREPORT:QUEUE /OUT:"c:\Users\sayal\OneDrive\Desktop\AIK\driver_stub\AikKmdfIoctl\x64\Debug\AikKmdfIoctl.sys" /VERSION:"10.0" /INCREMENTAL:NO /NOLOGO /WX /SECTION:"INIT,d" \BufferOverflowK.lib "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\km\x64\ntoskrnl.lib" "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\km\x64\hal.lib" "C:\Program Files (x86)\Windows Kits\10\lib\10.0.26100.0\km\x64\wmilib.lib" "C:\Program Files (x86)\Windows Kits\10\lib\wdf\kmdf\x64\1.15\WdfLdr.lib" "C:\Program Files (x86)\Windows Kits\10\lib\wdf\kmdf\x64\1.15\WdfDriverEntry.lib" /NODEFAULTLIB /MANIFEST:NO /DEBUG /PDB:"c:\Users\sayal\OneDrive\Desktop\AIK\driver_stub\AikKmdfIoctl\x64\Debug\AikKmdfIoctl.pdb" /SUBSYSTEM:NATIVE,"10.00" /Driver /OPT:REF /OPT:ICF /ENTRY:"FxDriverEntry" /RELEASE /IMPLIB:"c:\Users\sayal\OneDrive\Desktop\AIK\driver_stub\AikKmdfIoctl\x64\Debug\AikKmdfIoctl.lib" /MERGE:"_TEXT=.text;_PAGE=PAGE" /MACHINE:X64 /PROFILE /guard:cf /kernel /IGNORE:4198,4010,4037,4039,4065,4070,4078,4087,4089,4221,4108,4088,4218,4218,4235 /osversion:10.0 /pdbcompress /debugtype:pdata x64\Debug\obj\Driver.obj
+  x64\Debug\obj\Device.obj
+  x64\Debug\obj\Queue.obj
+  AikKmdfIoctl.vcxproj -> c:\Users\sayal\OneDrive\Desktop\AIK\driver_stub\AikKmdfIoctl\x64\Debug\AikKmdfIoctl.sys
+DriverPackageTarget:
+  Packaging up the following projects for the following configurations:
+  
+   Configuration='' Platform=''
+  
+  
+  The following files will be packaged:
+  
+  File to package:      .
+  Location in Package:  .
+  Requested by project: 
+  
+  
+DrvCat:
+  DrvCat task was skipped as there was no catalog file to process
+  
+FinalizeBuildStatus:
+  Deleting file "x64\Debug\obj\AikKmdfIoctl.tlog\unsuccessfulbuild".
+  Touching "x64\Debug\obj\AikKmdfIoctl.tlog\AikKmdfIoctl.lastbuildstate".
+Done Building Project "c:\Users\sayal\OneDrive\Desktop\AIK\driver_stub\AikKmdfIoctl\AikKmdfIoctl.vcxproj" (Rebuild target(s)).
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:01.89

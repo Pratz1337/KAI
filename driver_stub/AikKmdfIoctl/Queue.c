@@ -1,6 +1,7 @@
 #include <ntddk.h>
 #include <wdf.h>
-#include <ntddkbd.h>    // KEYBOARD_INPUT_DATA, connect structs
+#include <ntddkbd.h>    // KEYBOARD_INPUT_DATA
+#include <kbdmou.h>     // CONNECT_DATA, PSERVICE_CALLBACK_ROUTINE
 
 #include "Public.h"
 

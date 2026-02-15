@@ -79,7 +79,7 @@ class InputInjector:
     Input injection with optional kernel driver support.
     
     By default uses user-mode SendInput API. If a DriverBridge is provided
-    and connected, can use kernel-mode injection for bypassing UIPI.
+    and connected, can use an optional kernel driver for lower-level injection.
     """
     
     def __init__(

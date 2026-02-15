@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 """
 Test script to verify all AIK components work correctly.
 """
@@ -16,10 +16,11 @@ def test_imports():
         from aik.kill_switch import KillSwitch
         from aik.window_context import get_foreground_window
         from aik.input_injector import InputInjector
-        print("✓ All imports successful")
+        from aik.session_memory import SessionMemory
+        print("[OK] All imports successful")
         return True
     except Exception as e:
-        print(f"✗ Import failed: {e}")
+        print(f"[FAIL] Import failed: {e}")
         return False
 
 
@@ -30,10 +31,10 @@ def test_screen_capture():
         from aik.capture import ScreenCapturer
         sc = ScreenCapturer()
         shot = sc.capture()
-        print(f"✓ Screenshot: {shot.width}x{shot.height}, {len(shot.png):,} bytes PNG")
+        print(f"[OK] Screenshot: {shot.width}x{shot.height}, {len(shot.png):,} bytes PNG")
         return True
     except Exception as e:
-        print(f"✗ Screen capture failed: {e}")
+        print(f"[FAIL] Screen capture failed: {e}")
         return False
 
 
@@ -43,12 +44,12 @@ def test_window_context():
     try:
         from aik.window_context import get_foreground_window
         fg = get_foreground_window()
-        print(f"✓ Active window: {fg.title[:60]}...")
+        print(f"[OK] Active window: {fg.title[:60]}...")
         print(f"  Process: {fg.process_path}")
         print(f"  PID: {fg.pid}")
         return True
     except Exception as e:
-        print(f"✗ Window context failed: {e}")
+        print(f"[FAIL] Window context failed: {e}")
         return False
 
 
@@ -69,12 +70,18 @@ def test_action_parser():
         })
         
         plan = parse_plan(test_json)
-        print(f"✓ Parsed {len(plan.actions)} actions:")
+        print(f"[OK] Parsed {len(plan.actions)} actions:")
         for a in plan.actions:
             print(f"    {a}")
+
+        # Robustness: tolerate extra text / multiple JSON objects in model output.
+        plan2 = parse_plan(test_json + "\n\nNOTE: done")
+        assert len(plan2.actions) == len(plan.actions)
+        plan3 = parse_plan(test_json + "\n" + test_json)
+        assert len(plan3.actions) == len(plan.actions)
         return True
     except Exception as e:
-        print(f"✗ Action parser failed: {e}")
+        print(f"[FAIL] Action parser failed: {e}")
         return False
 
 
@@ -88,14 +95,14 @@ def test_input_injector():
         tests = [('enter', 0x0D), ('ctrl', 0x11), ('a', 0x41), ('f1', 0x70)]
         for key, expected in tests:
             vk = _vk_from_key_name(key)
-            status = "✓" if vk == expected else "✗"
+            status = "[OK]" if vk == expected else "[FAIL]"
             print(f"  {status} VK({key}) = {hex(vk)}")
         
         injector = InputInjector()
-        print("✓ InputInjector initialized")
+        print("[OK] InputInjector initialized")
         return True
     except Exception as e:
-        print(f"✗ Input injector failed: {e}")
+        print(f"[FAIL] Input injector failed: {e}")
         return False
 
 
@@ -116,16 +123,16 @@ def test_driver_bridge():
         db = DriverBridge()
         connected = db.connect()
         if connected:
-            print("✓ Driver connected!")
+            print("[OK] Driver connected!")
             pong = db.ping()
             print(f"  PING response: {pong}")
             db.disconnect()
         else:
-            print("○ Driver not loaded (expected if driver .sys not installed)")
+            print("[SKIP] Driver not loaded (expected if driver .sys not installed)")
         
         return True
     except Exception as e:
-        print(f"✗ Driver bridge failed: {e}")
+        print(f"[FAIL] Driver bridge failed: {e}")
         return False
 
 
@@ -141,18 +148,18 @@ def test_anthropic_client():
         model = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
         
         if not api_key:
-            print("○ ANTHROPIC_API_KEY not set (set in .env to enable)")
+            print("[SKIP] ANTHROPIC_API_KEY not set (set in .env to enable)")
             return True
         
         # Only test client creation, not actual API call
         from aik.anthropic_client import AnthropicClient
         client = AnthropicClient(api_key=api_key, model=model)
-        print(f"✓ Anthropic client initialized")
+        print(f"[OK] Anthropic client initialized")
         print(f"  Model: {model}")
         print(f"  API key: {api_key[:10]}...{api_key[-4:]}")
         return True
     except Exception as e:
-        print(f"✗ Anthropic client setup failed: {e}")
+        print(f"[FAIL] Anthropic client setup failed: {e}")
         return False
 
 
@@ -171,12 +178,12 @@ def test_prompt_building():
         )
         
         user_prompt = build_user_prompt(ctx)
-        print(f"✓ System prompt: {len(SYSTEM_PROMPT)} chars")
-        print(f"✓ User prompt: {len(user_prompt)} chars")
+        print(f"[OK] System prompt: {len(SYSTEM_PROMPT)} chars")
+        print(f"[OK] User prompt: {len(user_prompt)} chars")
         print(f"  Preview: {user_prompt[:100]}...")
         return True
     except Exception as e:
-        print(f"✗ Prompt building failed: {e}")
+        print(f"[FAIL] Prompt building failed: {e}")
         return False
 
 
@@ -187,12 +194,12 @@ def test_kill_switch():
         from aik.kill_switch import KillSwitch
         
         ks = KillSwitch()
-        print(f"✓ KillSwitch initialized")
+        print(f"[OK] KillSwitch initialized")
         print(f"  Triggered: {ks.triggered}")
         print("  Combo: Ctrl+Alt+Backspace")
         return True
     except Exception as e:
-        print(f"✗ Kill switch failed: {e}")
+        print(f"[FAIL] Kill switch failed: {e}")
         return False
 
 
@@ -217,7 +224,7 @@ def main():
         try:
             results.append((name, test_fn()))
         except Exception as e:
-            print(f"✗ {name} crashed: {e}")
+            print(f"[FAIL] {name} crashed: {e}")
             results.append((name, False))
     
     print("\n" + "=" * 50)
@@ -225,13 +232,13 @@ def main():
     print("=" * 50)
     passed = sum(1 for _, ok in results if ok)
     for name, ok in results:
-        status = "✓ PASS" if ok else "✗ FAIL"
+        status = "[OK] PASS" if ok else "[FAIL] FAIL"
         print(f"  {status}: {name}")
     
     print(f"\n{passed}/{len(results)} tests passed")
     
     if passed == len(results):
-        print("\n✓ All components working! Ready to run:")
+        print("\n[OK] All components working! Ready to run:")
         print('  python main.py --goal "Your task here" --dry-run')
     
     return 0 if passed == len(results) else 1
@@ -239,3 +246,6 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+

@@ -2,10 +2,10 @@
 Kernel-mode keyboard injector.
 
 Communicates with the AikKmdfIoctl driver via DeviceIoControl to inject
-raw scancodes directly into the keyboard input stack – bypassing UIPI,
-the secure desktop, and all user-mode protections.
+raw scancodes through an optional kernel driver.
 
-Falls back to user-mode SendInput when the driver is not loaded.
+Falls back to user-mode SendInput when the driver is not loaded,
+but only after exhausting all auto-recovery options (service start, etc.).
 """
 from __future__ import annotations
 
@@ -77,7 +77,7 @@ KEY_E0    = 2
 # scancodes that the driver injects into the keyboard class.
 # ---------------------------------------------------------------------------
 _VK_TO_SCAN: dict[int, tuple[int, bool]] = {
-    # letters A–Z  (0x41 – 0x5A)
+    # letters A-Z  (0x41 - 0x5A)
     0x41: (0x1E, False),  # A
     0x42: (0x30, False),  # B
     0x43: (0x2E, False),  # C
@@ -104,7 +104,7 @@ _VK_TO_SCAN: dict[int, tuple[int, bool]] = {
     0x58: (0x2D, False),  # X
     0x59: (0x15, False),  # Y
     0x5A: (0x2C, False),  # Z
-    # digits 0-9  (0x30 – 0x39)
+    # digits 0-9  (0x30 - 0x39)
     0x30: (0x0B, False),  # 0
     0x31: (0x02, False),  # 1
     0x32: (0x03, False),  # 2
@@ -115,7 +115,7 @@ _VK_TO_SCAN: dict[int, tuple[int, bool]] = {
     0x37: (0x08, False),  # 7
     0x38: (0x09, False),  # 8
     0x39: (0x0A, False),  # 9
-    # function keys F1–F12
+    # function keys F1-F12
     0x70: (0x3B, False),  # F1
     0x71: (0x3C, False),  # F2
     0x72: (0x3D, False),  # F3
@@ -220,7 +220,7 @@ def _vk_from_key_name(key: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Packet builder  –  packs an AIK_KEY_PACKET for DeviceIoControl
+# Packet builder - packs an AIK_KEY_PACKET for DeviceIoControl
 # ---------------------------------------------------------------------------
 def _build_key_packet(scancodes: list[tuple[int, int]]) -> bytes:
     """
@@ -229,7 +229,7 @@ def _build_key_packet(scancodes: list[tuple[int, int]]) -> bytes:
     Each entry in `scancodes` is (makecode, flags).
     Layout (pack=1):
         ULONG  Count
-        AIK_SCANCODE[Count]   –  each is (USHORT MakeCode, USHORT Flags)
+        AIK_SCANCODE[Count]   -  each is (USHORT MakeCode, USHORT Flags)
     Padded out to AIK_MAX_SCANCODES entries.
     """
     count = len(scancodes)
@@ -273,6 +273,38 @@ class KernelInputInjector:
     # ---- driver connection -------------------------------------------------
 
     def _connect(self) -> None:
+        # ----- Phase 1: Check if driver service is installed & running -----
+        svc_status = _check_driver_service()
+        if svc_status == "not_installed":
+            log.warning(
+                "Driver service not installed. "
+                "Run install_driver.ps1 as Administrator first."
+            )
+            if self._fallback:
+                self._handle = None
+                log.warning("Falling back to user-mode SendInput.")
+                from .input_injector import InputInjector
+                self._user_mode = InputInjector(inter_key_delay_s=self._delay)
+                return
+            raise RuntimeError(
+                "Driver service 'AikKmdfDriver' not installed. "
+                "Run: .\\install_driver.ps1 -SysPath <path-to-.sys>"
+            )
+
+        if svc_status == "stopped":
+            log.info("Driver service exists but is stopped. Attempting auto-start...")
+            started = _try_auto_start_service()
+            if started:
+                log.info("Driver service auto-started successfully.")
+                import time as _time
+                _time.sleep(1)  # give the driver a moment to create its device
+            else:
+                log.warning(
+                    "Could not auto-start driver service. "
+                    "Run 'sc.exe start AikKmdfDriver' as Administrator."
+                )
+
+        # ----- Phase 2: Try to open the device handle -----
         try:
             h = CreateFileW(
                 self._device_path,
@@ -293,9 +325,37 @@ class KernelInputInjector:
 
         except OSError as e:
             self._handle = None
+            winerr = getattr(e, "winerror", None)
+
+            # Provide specific guidance per error code
+            if winerr == 2:  # ERROR_FILE_NOT_FOUND
+                log.error(
+                    "Driver device not found at %s. Possible causes:\n"
+                    "  1. Driver service not started -> sc.exe start AikKmdfDriver\n"
+                    "  2. Driver .sys not installed  -> run install_driver.ps1\n"
+                    "  3. Driver crashed on load     -> check Event Viewer > System",
+                    self._device_path,
+                )
+            elif winerr == 5:  # ERROR_ACCESS_DENIED
+                log.error(
+                    "Access denied opening %s. Run Python as Administrator.",
+                    self._device_path,
+                )
+            elif winerr == 1275:  # ERROR_DRIVER_BLOCKED
+                log.error(
+                    "Driver blocked by Windows. Ensure test signing is enabled:\n"
+                    "  bcdedit /set testsigning on  (then reboot)"
+                )
+            else:
+                log.error(
+                    "Failed to connect to driver at %s: %s",
+                    self._device_path, e,
+                )
+
             if self._fallback:
                 log.warning(
-                    "Kernel driver not available (%s). Falling back to user-mode SendInput.", e
+                    "%s Falling back to user-mode SendInput.",
+                    _format_driver_connect_error(self._device_path, e),
                 )
                 from .input_injector import InputInjector
                 self._user_mode = InputInjector(inter_key_delay_s=self._delay)
@@ -375,7 +435,7 @@ class KernelInputInjector:
         """Type a single character via kernel scancodes."""
         vk = _vk_from_char(ch)
         if vk is None:
-            # Character not in our VK table – skip it with a warning.
+            # Character not in our VK table - skip it with a warning.
             log.warning("Cannot map character %r to scancode; skipping.", ch)
             return
         scan, ext = _vk_to_scancode(vk)
@@ -479,3 +539,79 @@ def _vk_from_char(ch: str) -> int | None:
 
 def _needs_shift(ch: str) -> bool:
     return ch in _SHIFT_CHARS
+
+
+def _format_driver_connect_error(device_path: str, exc: OSError) -> str:
+    winerr = getattr(exc, "winerror", None)
+    if winerr == 2:  # ERROR_FILE_NOT_FOUND
+        return f"Kernel driver device not found at {device_path!r} ([WinError 2])."
+    if winerr == 3:  # ERROR_PATH_NOT_FOUND
+        return f"Kernel driver path not found: {device_path!r} ([WinError 3])."
+    if winerr == 5:  # ERROR_ACCESS_DENIED
+        return f"Access denied opening kernel driver device {device_path!r} ([WinError 5])."
+    if winerr == 1275:  # ERROR_DRIVER_BLOCKED
+        return "Kernel driver appears blocked by the OS ([WinError 1275])."
+    return f"Kernel driver not available at {device_path!r} ({exc})."
+
+
+# ---------------------------------------------------------------------------
+#  Driver service management helpers
+# ---------------------------------------------------------------------------
+
+_SERVICE_NAMES = ["AikKmdfDriver", "AikKmdfIoctl"]
+
+
+def _check_driver_service() -> str:
+    """
+    Query the Windows Service Control Manager for the driver service.
+
+    Returns one of:
+        "running"       – service exists and is running
+        "stopped"       – service exists but is not running
+        "not_installed" – service not registered
+    """
+    import subprocess
+
+    for name in _SERVICE_NAMES:
+        try:
+            result = subprocess.run(
+                ["sc.exe", "query", name],
+                capture_output=True, text=True, timeout=10,
+            )
+            output = result.stdout + result.stderr
+            if "RUNNING" in output:
+                return "running"
+            if "STOPPED" in output or "STATE" in output:
+                return "stopped"
+        except Exception:
+            continue
+
+    return "not_installed"
+
+
+def _try_auto_start_service() -> bool:
+    """Attempt to start the driver service.  Returns True on success."""
+    import subprocess
+
+    for name in _SERVICE_NAMES:
+        try:
+            result = subprocess.run(
+                ["sc.exe", "start", name],
+                capture_output=True, text=True, timeout=15,
+            )
+            combined = result.stdout + result.stderr
+            if result.returncode == 0 or "RUNNING" in combined:
+                log.info("Auto-started service '%s'.", name)
+                return True
+            if "Access is denied" in combined:
+                log.warning(
+                    "Cannot auto-start service '%s': access denied. "
+                    "Run Python as Administrator, or start it manually:\n"
+                    "  sc.exe start %s", name, name,
+                )
+                return False
+        except Exception as e:
+            log.debug("Failed to start service '%s': %s", name, e)
+
+    return False
+

@@ -1,0 +1,2 @@
+﻿Microsoft.DriverKit.Build.Tasks.17.0.dll
+Microsoft.DriverKit.Build.Tasks.PackageVerifier.17.0.dll
