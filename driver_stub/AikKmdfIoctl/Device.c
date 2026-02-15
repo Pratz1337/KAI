@@ -10,10 +10,19 @@ NTSTATUS AikCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
     WDFDEVICE device;
     NTSTATUS status;
     WDF_OBJECT_ATTRIBUTES attrs;
+    UNICODE_STRING deviceName;
     UNICODE_STRING symLink;
 
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
     WdfDeviceInitSetIoType(DeviceInit, WdfDeviceIoBuffered);
+
+    RtlInitUnicodeString(&deviceName, AIK_DEVICE_NAME);
+    status = WdfDeviceInitAssignName(DeviceInit, &deviceName);
+    if (!NT_SUCCESS(status))
+    {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "AIK: WdfDeviceInitAssignName failed: 0x%08X\n", status));
+        return status;
+    }
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attrs);
 

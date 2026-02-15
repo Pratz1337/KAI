@@ -58,6 +58,9 @@ CloseHandle.argtypes = [wintypes.HANDLE]
 CloseHandle.restype = wintypes.BOOL
 
 
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+
 def open_device(path: str) -> wintypes.HANDLE:
     h = CreateFileW(
         path,
@@ -68,7 +71,7 @@ def open_device(path: str) -> wintypes.HANDLE:
         FILE_ATTRIBUTE_NORMAL,
         None,
     )
-    if h == wintypes.HANDLE(-1).value:
+    if h == INVALID_HANDLE_VALUE:
         raise ctypes.WinError(ctypes.get_last_error())
     return h
 
@@ -97,7 +100,7 @@ def ioctl(h: wintypes.HANDLE, code: int, in_data: bytes = b"", out_size: int = 2
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--path", default=r"\\\\.\\AikKmdfIoctl")
+    ap.add_argument("--path", default=r"\\.\AikKmdfIoctl")
     args = ap.parse_args()
 
     h = open_device(args.path)

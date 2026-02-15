@@ -48,6 +48,25 @@ Live typing:
 python main.py --goal "In the currently focused app, type: Hello World and press Enter"
 ```
 
+Interactive terminal mode (re-enter goals without retyping full command):
+
+```powershell
+python tools/interactive_run.py
+```
+
+Starts in **live typing mode** by default. To start safely in dry-run mode:
+
+```powershell
+python tools/interactive_run.py --dry-run-start
+```
+
+Interactive commands:
+
+- `/dry` -> dry-run mode (safe, prints plan only)
+- `/live` -> live typing mode
+- `/status` -> show current mode
+- `/quit` -> exit
+
 Kill switch:
 
 - Press `Ctrl+Alt+Backspace` at any time to stop the agent immediately.
@@ -72,4 +91,6 @@ The model must output JSON like:
 
 See `driver_stub/` for a **non-injecting** KMDF IOCTL driver skeleton you can use to validate user-mode -> kernel
 communication (ping/echo + debug logging). It is intentionally not a keyboard filter and does not inject input.
+
+To build the driver stub, you need Visual Studio with C++ tools + Windows SDK + WDK component installed.
 
