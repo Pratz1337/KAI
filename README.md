@@ -1,3 +1,6 @@
+# PyPi package ``` pip install kai-agent ```
+# General use command ``` kai-agent --goal "write your task here " ```
+- you will need Anthorpic api keys anad Sarvam API key (optional for voice mode) for the agent to function
 # AIK (AI Keyboard) - Vision-Based Keyboard Automation
 
 A Windows-based AI agent that uses **Claude Vision (Haiku 4.5)** to understand your screen and perform keyboard-only automation tasks. The agent captures screenshots, analyzes them with AI, and executes keyboard actions to accomplish your goals.
