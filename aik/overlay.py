@@ -38,6 +38,15 @@ class Overlay:
     def update(self, state: OverlayState) -> None:
         self._q.put(state)
 
+    def hide_for_capture(self) -> None:
+        """Temporarily hide so it won't appear in screenshots."""
+        self._q.put("__HIDE__")
+        import time; time.sleep(0.08)
+
+    def show_after_capture(self) -> None:
+        """Re-show after screenshot."""
+        self._q.put("__SHOW__")
+
     def _run(self) -> None:
         try:
             import tkinter as tk
@@ -80,6 +89,13 @@ class Overlay:
                     if item is None:
                         root.destroy()
                         return
+                    if isinstance(item, str):
+                        if item == "__HIDE__":
+                            root.withdraw()
+                        elif item == "__SHOW__":
+                            root.deiconify()
+                            root.lift()
+                        continue
                     state = item
             except queue.Empty:
                 pass

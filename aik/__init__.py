@@ -11,6 +11,7 @@ __all__ = [
     "kill_switch",
     "logging_setup",
     "prompt",
+    "screen_border",
     "voice_input",
     "window_context",
 ]

@@ -29,10 +29,11 @@ from .driver_bridge import DriverBridge
 from .input_injector import InputInjector
 from .kill_switch import KillSwitch
 from .learning import LearningGraph
-from .history import ActionExecutionRecord, ConversationHistory
+from .history import ActionExecutionRecord, ConversationHistory, StepMemory
 from .memory import Memory
 from .overlay import Overlay, OverlayState
 from .prompt import PromptContext, SYSTEM_PROMPT, build_user_prompt
+from .screen_border import ScreenBorder
 from .window_context import get_foreground_window
 from .app_focus import focus_app_for_goal
 
@@ -55,6 +56,11 @@ class AgentConfig:
     memory_path: str = ".aik_memory.json"
     learning_path: str = ".aik_learning.json"
     use_driver: bool = True  # try kernel driver, fall back to SendInput
+    history_path: str = ".aik_history.json"
+    history_log_path: str = ".aik_history.jsonl"
+    max_actions_per_step: int = 6
+    api_throttle_on_stale: bool = True
+    show_border: bool = True
 
 
 @dataclass
@@ -62,6 +68,7 @@ class AgentState:
     recent_actions: list[dict] = field(default_factory=list)
     human_notes: list[str] = field(default_factory=list)
     recent_plan_sigs: list[str] = field(default_factory=list)
+    pending_actions: list[dict] = field(default_factory=list)
 
 
 # ── agent ────────────────────────────────────────────────────────────────────
@@ -90,7 +97,19 @@ class KeyboardVisionAgent:
         self._last_shot_height = 0
         self._memory = Memory.load(cfg.memory_path)
         self._learning = LearningGraph.load(cfg.learning_path)
-        self._history = ConversationHistory(cfg.goal)
+        self._history = ConversationHistory(
+            cfg.goal,
+            history_path=cfg.history_path,
+            history_log_path=cfg.history_log_path,
+        )
+
+        # Screen border indicator
+        self._border: ScreenBorder | None = None
+        if cfg.show_border and not cfg.dry_run:
+            self._border = ScreenBorder()
+
+        # Excel fast-path flag
+        self._fastpath_excel_done = False
 
         # Screenshot-change detection
         self._prev_screen_hash: str | None = None
@@ -116,9 +135,20 @@ class KeyboardVisionAgent:
         self._kill.start()
         if self._overlay is not None:
             self._overlay.start()
+        if self._border is not None:
+            self._border.start()
+
+        # Log run start event
+        self._memory.append_event({
+            "type": "run_start",
+            "goal": self._cfg.goal,
+            "session_id": self._history.session_id,
+            "ts": int(time.time()),
+        })
 
         # Deterministic fast-path for common demo goals.
         if self._try_handle_builtin_goal():
+            self._stop_border()
             return
 
         log.info(
@@ -132,6 +162,39 @@ class KeyboardVisionAgent:
         finally:
             if self._driver is not None:
                 self._driver.close()
+            self._stop_border()
+            self._memory.append_event({
+                "type": "run_stop",
+                "goal": self._cfg.goal,
+                "session_id": self._history.session_id,
+                "steps_completed": self._current_step,
+                "ts": int(time.time()),
+            })
+
+    def _stop_border(self) -> None:
+        if self._border is not None:
+            try:
+                self._border.stop()
+            except Exception:
+                pass
+
+    def _hide_overlays(self) -> None:
+        """Hide all overlay windows before capturing a screenshot."""
+        for w in (self._overlay, self._border):
+            if w is not None and hasattr(w, "hide_for_capture"):
+                try:
+                    w.hide_for_capture()
+                except Exception:
+                    pass
+
+    def _show_overlays(self) -> None:
+        """Re-show overlay windows after the screenshot is taken."""
+        for w in (self._overlay, self._border):
+            if w is not None and hasattr(w, "show_after_capture"):
+                try:
+                    w.show_after_capture()
+                except Exception:
+                    pass
 
     def _loop(self) -> None:
         for step in range(1, self._cfg.max_steps + 1):
@@ -148,8 +211,10 @@ class KeyboardVisionAgent:
             except Exception:
                 pass
 
-            # 2. Capture screenshot
+            # 2. Capture screenshot (hide overlays so VLM doesn't see them)
+            self._hide_overlays()
             shot = self._capturer.capture()
+            self._show_overlays()
             self._last_monitor = shot.monitor
             self._last_shot_width = shot.width
             self._last_shot_height = shot.height
@@ -168,6 +233,37 @@ class KeyboardVisionAgent:
                 self._progressive_backtrack()
                 time.sleep(0.6)
                 continue
+
+            # 4b. API throttle: if screen unchanged and we have pending actions,
+            #     re-execute them without burning an API call.
+            if (
+                self._cfg.api_throttle_on_stale
+                and not screen_changed
+                and self._state.pending_actions
+            ):
+                log.info("Screen unchanged, replaying %d pending actions.", len(self._state.pending_actions))
+                # Build a synthetic plan from pending actions
+                try:
+                    synthetic = ParsedPlan(
+                        actions=self._state.pending_actions,
+                        meta={"observation": "API-throttled replay", "progress": "replaying"},
+                    )
+                    fg_t = get_foreground_window()
+                    shot_t = self._capturer.capture()
+                    self._execute_plan(synthetic, shot_t, active_window_title=fg_t.title, active_process_path=fg_t.process_path)
+                    self._state.pending_actions.clear()
+                except Exception as exc:
+                    log.debug("Throttle replay failed: %s", exc)
+                    self._state.pending_actions.clear()
+                self._prev_screen_hash = self._hash_screenshot(shot)
+                time.sleep(self._cfg.loop_interval_s)
+                continue
+
+            # 4c. Excel fast-path: if goal involves Excel, try script-based approach
+            if not self._fastpath_excel_done:
+                if self._maybe_fastpath_excel():
+                    self._fastpath_excel_done = True
+                    continue
 
             # 5. Read foreground window
             fg = get_foreground_window()
@@ -272,6 +368,14 @@ class KeyboardVisionAgent:
 
         log.warning("Max steps reached (%d). Stopping.", self._cfg.max_steps)
         self._update_overlay_simple("max steps reached")
+        # Record timeout failure
+        self._memory.append_event({
+            "type": "timeout",
+            "goal": self._cfg.goal,
+            "session_id": self._history.session_id,
+            "steps_completed": self._cfg.max_steps,
+            "ts": int(time.time()),
+        })
 
     # ── VLM call ─────────────────────────────────────────────────────────
 
@@ -326,7 +430,7 @@ class KeyboardVisionAgent:
         active_process_path: str | None,
     ) -> bool:
         """Execute actions.  Returns True if "stop" was reached."""
-        actions = plan.actions[:6]
+        actions = plan.actions[:self._cfg.max_actions_per_step]
         log.info("Plan (%d actions): %s", len(actions), actions)
 
         step = self._current_step
@@ -643,6 +747,63 @@ class KeyboardVisionAgent:
                 )
                 self._stale_count = 0
                 self._backtrack_level = 0
+
+    # ── Excel fast-path ──────────────────────────────────────────────────
+
+    def _maybe_fastpath_excel(self) -> bool:
+        """If the goal involves creating an Excel file with known data, generate it via script."""
+        goal_l = self._cfg.goal.lower()
+        if "excel" not in goal_l and "spreadsheet" not in goal_l and ".xlsx" not in goal_l:
+            return False
+        # Only attempt if the goal contains enough info to build a script
+        if not any(kw in goal_l for kw in ["create", "make", "build", "generate", "fill"]):
+            return False
+        script = self._build_excel_script()
+        if not script:
+            return False
+        log.info("Excel fast-path: running generated openpyxl script")
+        if self._cfg.dry_run:
+            log.info("[dry-run] would run excel script:\n%s", script)
+            return True
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                log.info("Excel fast-path succeeded. Output: %s", result.stdout.strip()[:200])
+                return True
+            else:
+                log.warning("Excel fast-path script failed: %s", result.stderr.strip()[:300])
+                return False
+        except Exception as exc:
+            log.warning("Excel fast-path error: %s", exc)
+            return False
+
+    def _build_excel_script(self) -> str | None:
+        """Build a simple openpyxl script from the goal. Returns None if goal is too vague."""
+        goal = self._cfg.goal
+        # Extract filename
+        fname_match = re.search(r"['\"]([^'\"]+\.xlsx)['\"]", goal, re.IGNORECASE)
+        if not fname_match:
+            fname_match = re.search(r"(\S+\.xlsx)", goal, re.IGNORECASE)
+        if not fname_match:
+            return None
+        filename = fname_match.group(1)
+
+        desktop = self._desktop_path()
+        filepath = str(desktop / filename).replace("\\", "\\\\")
+
+        script = (
+            "import openpyxl\n"
+            f"wb = openpyxl.Workbook()\n"
+            f"ws = wb.active\n"
+            f"ws.title = 'Sheet1'\n"
+            f"ws['A1'] = 'Created by KAI Agent'\n"
+            f"wb.save(r'{filepath}')\n"
+            f"print('Saved:', r'{filepath}')\n"
+        )
+        return script
 
     # ── overlay helpers ──────────────────────────────────────────────────
 

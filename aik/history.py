@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -46,6 +48,12 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _new_session_id() -> str:
+    """Timestamp-prefixed unique session ID (lexicographically sortable)."""
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{ts}-{uuid.uuid4().hex[:8]}"
+
+
 def _action_signature(action: dict) -> str:
     action_type = str(action.get("type", "")).lower()
     if action_type == "type_text":
@@ -72,8 +80,24 @@ def _contains_any(text: str, needles: list[str]) -> bool:
     return any(n in lowered for n in needles)
 
 
+def _append_jsonl(path: str, record: dict) -> None:
+    """Append a single JSON record as one line to a JSONL file."""
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True, default=str) + "\n")
+    except Exception:
+        pass  # best-effort logging
+
+
 class ConversationHistory:
-    def __init__(self, goal: str, *, keep_recent_steps: int = 10) -> None:
+    def __init__(
+        self,
+        goal: str,
+        *,
+        keep_recent_steps: int = 10,
+        history_path: str | None = None,
+        history_log_path: str | None = None,
+    ) -> None:
         self.goal = goal
         self.keep_recent_steps = max(2, keep_recent_steps)
         self._task_message = self._build_initial_task_message(goal)
@@ -82,6 +106,22 @@ class ConversationHistory:
         # Persistent log of ALL actions ever executed (never trimmed by keep_recent_steps)
         self._action_log: list[str] = []
 
+        # Session persistence
+        self._session_id = _new_session_id()
+        self._started_at_utc = _utc_now_iso()
+        self._history_path = history_path  # multi-session JSON file
+        self._history_log_path = history_log_path  # append-only JSONL step log
+        self._previous_sessions: list[dict] = []
+        if history_path:
+            self._load_previous_sessions()
+            self.save()
+
+    # ── session properties ───────────────────────────────────────────────
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
     @property
     def steps(self) -> list[StepMemory]:
         return self._steps
@@ -89,6 +129,71 @@ class ConversationHistory:
     @property
     def progress(self) -> ProgressChecklist:
         return self._progress
+
+    # ── session persistence ──────────────────────────────────────────────
+
+    def save(self) -> None:
+        """Persist all sessions (previous + current) to the history JSON file."""
+        if not self._history_path:
+            return
+        current = {
+            "session_id": self._session_id,
+            "goal": self.goal,
+            "started_at_utc": self._started_at_utc,
+            "steps_count": len(self._steps),
+            "action_log": self._action_log[-100:],
+        }
+        payload = {
+            "format": "aik_history_v2",
+            "sessions": self._previous_sessions + [current],
+        }
+        try:
+            tmp = self._history_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=True, indent=1)
+            os.replace(tmp, self._history_path)
+        except Exception:
+            pass  # best-effort
+
+    def _load_previous_sessions(self) -> None:
+        """Load older sessions from the history JSON file (supports legacy format)."""
+        if not self._history_path or not os.path.isfile(self._history_path):
+            return
+        try:
+            with open(self._history_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and data.get("format") == "aik_history_v2":
+                self._previous_sessions = data.get("sessions", [])
+            elif isinstance(data, dict) and "steps" in data:
+                # Legacy single-session format
+                self._previous_sessions = [data]
+            elif isinstance(data, list):
+                self._previous_sessions = data
+        except Exception:
+            self._previous_sessions = []
+
+    def persist_step_jsonl(self, step_memory: StepMemory) -> None:
+        """Append a step record to the JSONL log file."""
+        if not self._history_log_path:
+            return
+        record = {
+            "session_id": self._session_id,
+            "step": step_memory.step,
+            "observed": step_memory.observed,
+            "planned_actions": step_memory.planned_actions,
+            "executed_actions": [
+                {
+                    "action": r.action,
+                    "success": r.success,
+                    "duration_ms": r.duration_ms,
+                    "error": r.error,
+                }
+                for r in step_memory.executed_actions
+            ],
+            "success": step_memory.success,
+            "timestamp_utc": step_memory.timestamp_utc,
+        }
+        _append_jsonl(self._history_log_path, record)
 
     @staticmethod
     def _build_initial_task_message(goal: str) -> str:
@@ -224,7 +329,7 @@ class ConversationHistory:
         executed_actions: list[ActionExecutionRecord],
         success: bool,
         screenshot_png: bytes,
-    ) -> None:
+    ) -> StepMemory:
         memory = StepMemory(
             step=step,
             observed=observed,
@@ -240,6 +345,11 @@ class ConversationHistory:
         # Append to persistent action log (never trimmed)
         for rec in executed_actions:
             self._action_log.append(self._summarize_action_record(rec, step))
+
+        # Persist session + JSONL
+        self.save()
+        self.persist_step_jsonl(memory)
+        return memory
 
     @staticmethod
     def _summarize_action_record(rec: ActionExecutionRecord, step: int) -> str:

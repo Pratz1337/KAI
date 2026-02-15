@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from dataclasses import dataclass
 
 import random
 import time
 
 import httpx
+
+log = logging.getLogger("aik.anthropic_client")
 
 
 @dataclass(frozen=True)
@@ -18,7 +21,7 @@ class AnthropicResponse:
 
 class AnthropicClient:
     """
-    Minimal Anthropic Messages API client (no external SDK dependency).
+    Minimal Anthropic Messages API client with round-robin API key load balancing.
     """
 
     def __init__(
@@ -26,15 +29,51 @@ class AnthropicClient:
         api_key: str,
         model: str,
         *,
+        extra_api_keys: list[str] | None = None,
         base_url: str = "https://api.anthropic.com",
         anthropic_version: str = "2023-06-01",
         timeout_s: float = 60.0,
     ) -> None:
-        self._api_key = api_key
+        # Build the key pool — deduplicate while preserving order
+        all_keys: list[str] = []
+        seen: set[str] = set()
+        for k in [api_key] + (extra_api_keys or []):
+            k = k.strip()
+            if k and k not in seen:
+                all_keys.append(k)
+                seen.add(k)
+        self._api_keys = all_keys
+        self._key_index = 0
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._anthropic_version = anthropic_version
         self._timeout_s = timeout_s
+        # Track per-key rate-limit state: key -> earliest usable time
+        self._key_cooldowns: dict[str, float] = {}
+        log.info("Anthropic client initialised with %d API key(s)", len(self._api_keys))
+
+    @property
+    def _api_key(self) -> str:
+        """Return the next usable key via round-robin, skipping rate-limited ones."""
+        now = time.monotonic()
+        n = len(self._api_keys)
+        for _ in range(n):
+            key = self._api_keys[self._key_index % n]
+            cooldown = self._key_cooldowns.get(key, 0.0)
+            if now >= cooldown:
+                return key
+            self._key_index = (self._key_index + 1) % n
+        # All keys on cooldown — return the one with the soonest cooldown
+        return min(self._api_keys, key=lambda k: self._key_cooldowns.get(k, 0.0))
+
+    def _rotate_key(self) -> None:
+        """Advance to the next key in the pool."""
+        self._key_index = (self._key_index + 1) % len(self._api_keys)
+
+    def _mark_key_rate_limited(self, key: str, backoff_s: float) -> None:
+        """Mark a key as rate-limited until now + backoff."""
+        self._key_cooldowns[key] = time.monotonic() + backoff_s
+        log.info("Key ...%s rate-limited for %.1fs, rotating", key[-6:], backoff_s)
 
     def create_message(
         self,
@@ -96,16 +135,32 @@ class AnthropicClient:
         last_exc: Exception | None = None
         with httpx.Client(timeout=self._timeout_s) as client:
             for attempt in range(1, 9):
+                # Pick the best key for this attempt
+                current_key = self._api_key
+                headers["x-api-key"] = current_key
                 try:
                     resp = client.post(url, headers=headers, json=payload)
-                    if resp.status_code in {429, 500, 502, 503, 504, 529}:
+                    if resp.status_code in {429, 529}:
+                        # Rate limited — mark this key and rotate immediately
                         retry_after = resp.headers.get("retry-after")
+                        cooldown = backoff_s
                         if retry_after:
                             try:
-                                backoff_s = max(backoff_s, float(retry_after))
+                                cooldown = max(backoff_s, float(retry_after))
                             except ValueError:
                                 pass
-                        # Add a bit of jitter to avoid thundering herd.
+                        self._mark_key_rate_limited(current_key, cooldown)
+                        self._rotate_key()
+                        # If we have multiple keys, try the next one right away
+                        if len(self._api_keys) > 1:
+                            jitter = random.uniform(0.1, 0.5)
+                            _sleep_interruptibly(jitter)
+                        else:
+                            jitter = random.uniform(0.0, min(1.0, backoff_s / 3.0))
+                            _sleep_interruptibly(backoff_s + jitter)
+                        backoff_s = min(backoff_s * 2.0, 30.0)
+                        continue
+                    if resp.status_code in {500, 502, 503, 504}:
                         jitter = random.uniform(0.0, min(1.0, backoff_s / 3.0))
                         _sleep_interruptibly(backoff_s + jitter)
                         backoff_s = min(backoff_s * 2.0, 30.0)
@@ -114,6 +169,7 @@ class AnthropicClient:
                     return resp.json()
                 except Exception as exc:
                     last_exc = exc
+                    self._rotate_key()
                     jitter = random.uniform(0.0, min(1.0, backoff_s / 3.0))
                     _sleep_interruptibly(backoff_s + jitter)
                     backoff_s = min(backoff_s * 2.0, 30.0)

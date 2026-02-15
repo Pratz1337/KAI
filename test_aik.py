@@ -280,3 +280,116 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ── pytest-style tests (run with: python -m pytest test_aik.py -v) ───────────
+
+import os
+import tempfile
+
+
+def test_history_session_id():
+    from aik.history import ConversationHistory
+    h = ConversationHistory("Test goal")
+    assert h.session_id and len(h.session_id) > 10
+
+
+def test_history_append_returns_memory():
+    from aik.history import ActionExecutionRecord, ConversationHistory
+    h = ConversationHistory("Test goal")
+    rec = ActionExecutionRecord(
+        step=1, action={"type": "key_press", "key": "a"},
+        success=True, duration_ms=10, error=None,
+        timestamp_utc="2025-01-01T00:00:00Z",
+    )
+    mem = h.append_step(
+        step=1, observed="screen",
+        planned_actions=[{"type": "key_press", "key": "a"}],
+        executed_actions=[rec], success=True, screenshot_png=b"\x89PNG",
+    )
+    assert mem is not None and mem.step == 1
+
+
+def test_history_save_load():
+    from aik.history import ConversationHistory
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        path = f.name
+    try:
+        ConversationHistory("Goal A", history_path=path)
+        assert os.path.isfile(path)
+        with open(path) as fh:
+            data = json.load(fh)
+        assert data["format"] == "aik_history_v2"
+        assert len(data["sessions"]) == 1
+
+        ConversationHistory("Goal B", history_path=path)
+        with open(path) as fh:
+            data2 = json.load(fh)
+        assert len(data2["sessions"]) == 2
+    finally:
+        os.unlink(path)
+
+
+def test_history_jsonl_logging():
+    from aik.history import ActionExecutionRecord, ConversationHistory
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+        path = f.name
+    try:
+        h = ConversationHistory("JSONL test", history_log_path=path)
+        rec = ActionExecutionRecord(
+            step=1, action={"type": "key_press", "key": "enter"},
+            success=True, duration_ms=5, error=None,
+            timestamp_utc="2025-01-01T00:00:00Z",
+        )
+        h.append_step(
+            step=1, observed="obs",
+            planned_actions=[{"type": "key_press", "key": "enter"}],
+            executed_actions=[rec], success=True, screenshot_png=b"\x89PNG",
+        )
+        with open(path) as fh:
+            lines = [l.strip() for l in fh if l.strip()]
+        assert len(lines) >= 1
+        entry = json.loads(lines[0])
+        assert entry["step"] == 1
+    finally:
+        os.unlink(path)
+
+
+def test_action_signature_values():
+    from aik.history import _action_signature
+    assert _action_signature({"type": "key_press", "key": "Enter"}) == "key_press:enter"
+    assert _action_signature({"type": "type_text", "text": "Hello"}) == "type_text:hello"
+    assert _action_signature({"type": "hotkey", "keys": ["ctrl", "s"]}) == "hotkey:ctrl+s"
+
+
+def test_anthropic_key_rotation():
+    from aik.anthropic_client import AnthropicClient
+    c = AnthropicClient(api_key="key-1", model="test", extra_api_keys=["key-2", "key-3"])
+    keys_seen = set()
+    for _ in range(6):
+        keys_seen.add(c._api_key)
+        c._rotate_key()
+    assert len(keys_seen) == 3
+
+
+def test_progress_checklist_render():
+    from aik.history import ProgressChecklist
+    pc = ProgressChecklist(tasks=["Open App", "Do work"], completed={"Open App"})
+    rendered = pc.render()
+    assert "☑ Open App" in rendered
+    assert "☐ Do work" in rendered
+
+
+def test_screen_border_importable():
+    from aik.screen_border import ScreenBorder
+    assert ScreenBorder is not None
+
+
+def test_agent_config_new_fields():
+    from aik.agent import AgentConfig
+    cfg = AgentConfig(
+        goal="test", history_path=".t.json", history_log_path=".t.jsonl",
+        max_actions_per_step=4, api_throttle_on_stale=False, show_border=False,
+    )
+    assert cfg.max_actions_per_step == 4
+    assert cfg.show_border is False

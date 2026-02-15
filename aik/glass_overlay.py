@@ -166,6 +166,15 @@ class GlassOverlay:
         """Signal the overlay that the agent has finished."""
         self._q.put("__IDLE__")
 
+    def hide_for_capture(self) -> None:
+        """Temporarily hide the overlay so it won't appear in screenshots."""
+        self._q.put("__HIDE__")
+        import time; time.sleep(0.08)  # give tkinter time to process
+
+    def show_after_capture(self) -> None:
+        """Re-show the overlay after the screenshot is taken."""
+        self._q.put("__SHOW__")
+
     # ── hotkey listener ──────────────────────────────────────────────
 
     def _start_hotkey_listener(self) -> None:
@@ -195,9 +204,12 @@ class GlassOverlay:
         root.attributes("-alpha", 0.94)
         root.configure(bg=_C.BG)
 
-        W, H = 500, 500
+        W, H = 460, 480
         sx, sy = root.winfo_screenwidth(), root.winfo_screenheight()
-        root.geometry(f"{W}x{H}+{(sx - W) // 2}+{(sy - H) // 2}")
+        # Position at bottom-right corner (with padding) so it doesn't
+        # interfere with the agent's mouse actions in the main workspace.
+        pad_x, pad_y = 16, 48  # taskbar clearance
+        root.geometry(f"{W}x{H}+{sx - W - pad_x}+{sy - H - pad_y}")
 
         self._build_ui(root, tk)
         root.update_idletasks()
@@ -393,6 +405,8 @@ class GlassOverlay:
 
     # ── Polling loop ─────────────────────────────────────────────────
 
+    _lift_counter: int = 0
+
     def _poll(self, root, tk) -> None:
         # Process state queue
         try:
@@ -404,6 +418,10 @@ class GlassOverlay:
                 if isinstance(item, str):
                     if item == "__IDLE__":
                         self._set_idle_mode(root)
+                    elif item == "__HIDE__":
+                        self._hide(root)
+                    elif item == "__SHOW__":
+                        self._show(root)
                 else:
                     self._last_state = item
                     if not self._in_running_mode:
@@ -431,6 +449,17 @@ class GlassOverlay:
         if self._toggle_event.is_set():
             self._toggle_event.clear()
             self._toggle_visibility(root)
+
+        # Periodic re-lift: keep overlay on top even when other apps steal focus
+        # (every ~3 seconds = 30 poll cycles at 100ms)
+        self._lift_counter += 1
+        if self._lift_counter % 30 == 0:
+            try:
+                if root.state() != "withdrawn":
+                    root.lift()
+                    root.attributes("-topmost", True)
+            except Exception:
+                pass
 
         root.after(100, lambda: self._poll(root, tk))
 

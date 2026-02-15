@@ -34,6 +34,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--memory", default=os.getenv("AIK_MEMORY_PATH", ".aik_memory.json"), help="Path to local agent memory JSON.")
     p.add_argument("--learning", default=os.getenv("AIK_LEARNING_PATH", ".aik_learning.json"), help="Path to learning graph JSON.")
     p.add_argument("--no-driver", action="store_true", help="Disable kernel-driver injection (use SendInput only).")
+    p.add_argument("--history-path", default=os.getenv("AIK_HISTORY_PATH", ".aik_history.json"), help="Path to session history JSON.")
+    p.add_argument("--history-log-path", default=os.getenv("AIK_HISTORY_LOG_PATH", ".aik_history.jsonl"), help="Path to append-only JSONL step log.")
+    p.add_argument("--no-border", action="store_true", help="Disable the purple screen border indicator.")
     p.add_argument("--voice-provider", choices=["sarvam", "google"], default="sarvam", help="Voice-to-text provider for mic.")
     p.add_argument("--voice-lang", default="en-IN", help="Comma-separated language codes for voice recognition.")
     return p.parse_args(argv)
@@ -66,9 +69,17 @@ def main(argv: list[str]) -> int:
         print("Missing ANTHROPIC_API_KEY (set it in env or .env).", file=sys.stderr)
         return 2
 
+    # Collect extra API keys for load balancing (ANTHROPIC_API_KEY_2, _3, …)
+    extra_keys: list[str] = []
+    for i in range(2, 20):
+        k = os.getenv(f"ANTHROPIC_API_KEY_{i}", "").strip()
+        if k:
+            extra_keys.append(k)
+
     client = AnthropicClient(
         api_key=api_key,
         model=args.model,
+        extra_api_keys=extra_keys,
         base_url=args.base_url,
         anthropic_version=args.anthropic_version,
     )
@@ -116,6 +127,9 @@ def main(argv: list[str]) -> int:
         memory_path=args.memory,
         learning_path=args.learning,
         use_driver=not args.no_driver,
+        history_path=args.history_path,
+        history_log_path=args.history_log_path,
+        show_border=not args.no_border,
     )
 
     agent = KeyboardVisionAgent(cfg, anthropic=client, kill_switch=ks, overlay=ov)
