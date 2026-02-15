@@ -126,23 +126,35 @@ def test_driver_bridge():
     print("\n" + "=" * 50)
     print("Testing driver bridge...")
     try:
-        from aik.driver_bridge import DriverBridge, get_scancode, SCANCODE_MAP, EXTENDED_KEYS
-        
-        # Test scancode mapping
-        print(f"  Scancode for 'a': {hex(SCANCODE_MAP['a'])}")
-        print(f"  Scancode for 'enter': {hex(SCANCODE_MAP['enter'])}")
-        
-        sc, ext = get_scancode('up')
-        print(f"  Extended key 'up': scancode={hex(sc)}, extended={ext}")
-        
-        # Test driver connection (expected to fail if driver not loaded)
+        from aik import driver_bridge as dbmod
+        DriverBridge = getattr(dbmod, "DriverBridge")
+
+        # Optional legacy helpers
+        if hasattr(dbmod, "SCANCODE_MAP"):
+            print(f"  Legacy scancode for 'a': {hex(dbmod.SCANCODE_MAP.get('a', 0))}")
+
         db = DriverBridge()
-        connected = db.connect()
-        if connected:
-            print("✓ Driver connected!")
-            pong = db.ping()
-            print(f"  PING response: {pong}")
-            db.disconnect()
+
+        # New API: open/is_open/close
+        opened = False
+        if hasattr(db, "open"):
+            opened = bool(db.open())
+        elif hasattr(db, "connect"):
+            opened = bool(db.connect())
+
+        if opened:
+            print("✓ Driver opened!")
+            if hasattr(db, "ping"):
+                ok = db.ping()
+                print(f"  PING ok: {ok}")
+            # Smoke-test inject_text if present (should not crash)
+            if hasattr(db, "inject_text"):
+                _ = db.inject_text("A")
+                print("  inject_text('A') invoked")
+            if hasattr(db, "close"):
+                db.close()
+            elif hasattr(db, "disconnect"):
+                db.disconnect()
         else:
             print("○ Driver not loaded (expected if driver .sys not installed)")
         

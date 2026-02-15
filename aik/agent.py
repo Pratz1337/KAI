@@ -1,49 +1,69 @@
+"""Core agent loop — vision → VLM → action execution.
+
+Restructured with:
+* Mouse + keyboard actions
+* Screenshot-change detection (stale screen → previous action failed)
+* Progressive backtracking when stuck
+* Learning graph integration (tips + failure avoidance)
+* Dual-mode injection: kernel driver (if loaded) or user-mode SendInput
+"""
+
 from __future__ import annotations
 
+import hashlib
 import logging
-import os
+import random
+import sys
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
+import os
 import re
 import subprocess
-
-import httpx
-
-from .history import ActionExecutionRecord, ConversationHistory
+from datetime import datetime, timezone
+from pathlib import Path
+from dataclasses import dataclass, field
 
 from .actions import ActionParseError, ParsedPlan, parse_plan
 from .anthropic_client import AnthropicClient
-from .capture import ScreenCapturer
-from .actions import ALLOWED_ACTION_TYPES
+from .capture import ScreenCapturer, Screenshot
+from .driver_bridge import DriverBridge
 from .input_injector import InputInjector
 from .kill_switch import KillSwitch
+from .learning import LearningGraph
+from .memory import Memory
+from .overlay import Overlay, OverlayState
 from .prompt import PromptContext, SYSTEM_PROMPT, build_user_prompt
 from .window_context import get_foreground_window
+from .app_focus import focus_app_for_goal
 
 log = logging.getLogger("aik.agent")
 
 
+# ── configuration ────────────────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class AgentConfig:
     goal: str
-    max_steps: int = 40
+    max_steps: int = 60
     loop_interval_s: float = 0.8
-    max_tokens: int = 700
+    max_tokens: int = 1024
     temperature: float = 0.2
     monitor_index: int = 1
     screenshot_max_width: int | None = 1280
     dry_run: bool = False
     inter_key_delay_s: float = 0.01
-    kernel_mode: bool = False
-    driver_path: str = r"\\.\AikKmdfIoctl"
+    memory_path: str = ".aik_memory.json"
+    learning_path: str = ".aik_learning.json"
+    use_driver: bool = True  # try kernel driver, fall back to SendInput
 
 
 @dataclass
 class AgentState:
     recent_actions: list[dict] = field(default_factory=list)
+    human_notes: list[str] = field(default_factory=list)
+    recent_plan_sigs: list[str] = field(default_factory=list)
 
+
+# ── agent ────────────────────────────────────────────────────────────────────
 
 class KeyboardVisionAgent:
     def __init__(
@@ -52,160 +72,485 @@ class KeyboardVisionAgent:
         *,
         anthropic: AnthropicClient,
         kill_switch: KillSwitch | None = None,
+        overlay: Overlay | None = None,
     ) -> None:
         self._cfg = cfg
         self._anthropic = anthropic
         self._kill = kill_switch or KillSwitch()
         self._capturer = ScreenCapturer(
-            monitor_index=cfg.monitor_index, max_width=cfg.screenshot_max_width
+            monitor_index=cfg.monitor_index, max_width=cfg.screenshot_max_width,
         )
-
-        if cfg.kernel_mode:
-            from .input_injector_kernel import KernelInputInjector
-            log.info("Using KERNEL-MODE injector (driver: %s)", cfg.driver_path)
-            self._injector = KernelInputInjector(
-                inter_key_delay_s=cfg.inter_key_delay_s,
-                device_path=cfg.driver_path,
-                fallback=True,
-            )
-        else:
-            self._injector = InputInjector(inter_key_delay_s=cfg.inter_key_delay_s)
-
+        self._injector = InputInjector(inter_key_delay_s=cfg.inter_key_delay_s)
         self._state = AgentState()
-        self._history = ConversationHistory(cfg.goal)
+        self._overlay = overlay
+        self._current_step = 0
+        self._last_monitor: dict | None = None
+        self._last_shot_width = 0
+        self._last_shot_height = 0
+        self._memory = Memory.load(cfg.memory_path)
+        self._learning = LearningGraph.load(cfg.learning_path)
+
+        # Screenshot-change detection
+        self._prev_screen_hash: str | None = None
+        self._stale_count = 0       # consecutive steps where screen didn't change
+        self._backtrack_level = 0   # progressive backtrack depth
+
+        # Driver bridge (optional)
+        self._driver: DriverBridge | None = None
+        self._injection_mode = "user-mode"
+        if cfg.use_driver:
+            drv = DriverBridge()
+            if drv.open() and drv.ping():
+                self._driver = drv
+                self._injection_mode = "kernel"
+                log.info("Kernel driver available — using kernel-mode injection.")
+            else:
+                drv.close()
+                log.info("Kernel driver not available — using user-mode SendInput.")
+
+    # ── main loop ────────────────────────────────────────────────────────
 
     def run(self) -> None:
         self._kill.start()
+        if self._overlay is not None:
+            self._overlay.start()
 
+        # Deterministic fast-path for common demo goals.
         if self._try_handle_builtin_goal():
             return
 
-        log.info("Starting agent. dry_run=%s max_steps=%d", self._cfg.dry_run, self._cfg.max_steps)
+        log.info(
+            "Agent starting. dry_run=%s  max_steps=%d  injection=%s",
+            self._cfg.dry_run, self._cfg.max_steps, self._injection_mode,
+        )
         log.info("Kill switch: Ctrl+Alt+Backspace")
 
         try:
-            for step in range(1, self._cfg.max_steps + 1):
-                if self._kill.triggered:
-                    log.warning("Kill switch triggered. Stopping.")
-                    return
+            self._loop()
+        finally:
+            if self._driver is not None:
+                self._driver.close()
 
-                fg = get_foreground_window()
-                if self._is_uac_secure_desktop(fg.process_path, fg.title):
-                    log.warning(
-                        "UAC prompt detected (secure desktop). Approve/dismiss it manually, then the agent will continue."
-                    )
-                    time.sleep(1.0)
-                    continue
+    def _loop(self) -> None:
+        for step in range(1, self._cfg.max_steps + 1):
+            self._current_step = step
 
-                if self._is_open_with_dialog(fg.title, fg.process_path):
-                    log.warning("'Open with' dialog detected. Dismissing with Esc.")
-                    if not self._cfg.dry_run:
-                        try:
-                            self._injector.key_press("esc")
-                            time.sleep(0.2)
-                            # Some variants ignore Esc; Alt+F4 is a safe fallback.
-                            self._injector.hotkey(["alt", "f4"])
-                        except Exception as exc:
-                            log.warning("Failed to dismiss 'Open with' dialog: %s", exc)
-                    time.sleep(0.5)
-                    continue
+            # 0. Kill switch
+            if self._kill.triggered:
+                log.warning("Kill switch triggered. Stopping.")
+                return
 
-                shot = self._capturer.capture()
+            # 1. Focus the target app (best-effort)
+            try:
+                focus_app_for_goal(self._cfg.goal)
+            except Exception:
+                pass
 
-                ctx = PromptContext(
+            # 2. Capture screenshot
+            shot = self._capturer.capture()
+            self._last_monitor = shot.monitor
+            self._last_shot_width = shot.width
+            self._last_shot_height = shot.height
+
+            # 3. Detect whether screen changed since last step
+            screen_changed = self._did_screen_change(shot)
+
+            if not screen_changed and self._state.recent_actions:
+                self._stale_count += 1
+            else:
+                self._stale_count = 0
+                self._backtrack_level = 0  # reset backtrack on progress
+
+            # 4. If stuck, try progressive backtracking
+            if self._stale_count >= 2:
+                self._progressive_backtrack()
+                time.sleep(0.6)
+                continue
+
+            # 5. Read foreground window
+            fg = get_foreground_window()
+
+            # If Windows is showing UAC on the secure desktop, automation can't interact.
+            if self._is_uac_secure_desktop(fg.process_path, fg.title):
+                log.warning(
+                    "UAC prompt detected (secure desktop). Approve/dismiss it manually, then the agent will continue."
+                )
+                time.sleep(1.0)
+                continue
+
+            # Handle Windows 'Open with / Choose an app' dialog so we don't get stuck.
+            if self._is_open_with_dialog(fg.title, fg.process_path):
+                log.warning("'Open with' dialog detected. Dismissing (Esc, then Alt+F4).")
+                if not self._cfg.dry_run:
+                    try:
+                        self._injector.key_press("esc")
+                        time.sleep(0.2)
+                        self._injector.hotkey(["alt", "f4"])
+                    except Exception as exc:
+                        log.warning("Failed to dismiss 'Open with' dialog: %s", exc)
+                time.sleep(0.6)
+                continue
+
+            # 6. Gather learning context
+            app_name = _detect_app(fg.title, fg.process_path)
+            tips = self._learning.get_tips(app=app_name, goal=self._cfg.goal)
+            failed = self._learning.get_recent_failures(app=app_name, goal=self._cfg.goal)
+
+            # 7. Build prompt
+            ctx = PromptContext(
                 goal=self._cfg.goal,
                 window_title=fg.title,
                 process_path=fg.process_path,
                 step=step,
                 recent_actions=self._state.recent_actions,
+                screenshot_width=shot.width,
+                screenshot_height=shot.height,
+                human_notes=self._state.human_notes,
+                learning_tips=tips,
+                failed_actions=failed,
+                screen_changed=screen_changed,
+                injection_mode=self._injection_mode,
+            )
+            user_prompt = build_user_prompt(ctx)
+
+            # 8. Call VLM
+            plan = self._call_vlm(shot, user_prompt, step)
+            if plan is None:
+                continue  # retry (rate-limit) or bail
+
+            # 9. Update overlay
+            self._update_overlay_plan(plan, step)
+
+            # 10. Stuck detection via plan signature
+            sig = _plan_signature(plan)
+            self._state.recent_plan_sigs.append(sig)
+            self._state.recent_plan_sigs = self._state.recent_plan_sigs[-5:]
+            if (
+                len(self._state.recent_plan_sigs) >= 2
+                and len(set(self._state.recent_plan_sigs[-2:])) == 1
+                and not screen_changed
+            ):
+                log.warning("Plan repetition + unchanged screen → stuck.")
+                self._stale_count = 2  # trigger backtrack on next iteration
+                # Record the repeated action as a failure for learning
+                if plan.actions:
+                    self._learning.record_failure(
+                        app=app_name,
+                        goal=self._cfg.goal,
+                        action=plan.actions[0],
+                        reason="Repeated same action with no screen change",
+                    )
+                continue
+
+            # 11. Execute plan
+            if self._execute_plan(plan, shot):
+                # Record success
+                self._learning.record_success(
+                    app=app_name,
+                    goal=self._cfg.goal,
+                    actions=self._state.recent_actions[-12:],
+                    note=f"Completed: {self._cfg.goal}",
                 )
-                user_prompt = build_user_prompt(ctx)
+                return
 
-                history_messages = self._history.build_messages_for_decision(
-                step=step,
-                screenshot_png=shot.png,
-                active_window_title=fg.title,
-                active_process_path=fg.process_path,
+            # 12. Save screenshot hash for next comparison
+            self._prev_screen_hash = self._hash_screenshot(shot)
+
+            # Sleep between cycles
+            if self._cfg.loop_interval_s:
+                time.sleep(self._cfg.loop_interval_s)
+
+        log.warning("Max steps reached (%d). Stopping.", self._cfg.max_steps)
+        self._update_overlay_simple("max steps reached")
+
+    # ── VLM call ─────────────────────────────────────────────────────────
+
+    def _call_vlm(self, shot: Screenshot, user_prompt: str, step: int) -> ParsedPlan | None:
+        try:
+            resp = self._anthropic.create_message(
+                system=SYSTEM_PROMPT,
+                user_text=user_prompt,
+                image_png=shot.png,
+                max_tokens=self._cfg.max_tokens,
+                temperature=self._cfg.temperature,
+            )
+            try:
+                return parse_plan(resp.text)
+            except ActionParseError as pe:
+                # One repair attempt
+                repair = (
+                    f"Your previous response was INVALID: {pe}\n\n"
+                    "Return corrected JSON only matching the schema.\n\n"
+                    f"Original response:\n{resp.text or ''}"
                 )
+                resp2 = self._anthropic.create_message(
+                    system=SYSTEM_PROMPT,
+                    user_text=repair,
+                    image_png=shot.png,
+                    max_tokens=self._cfg.max_tokens,
+                    temperature=max(0.0, min(0.3, self._cfg.temperature)),
+                )
+                return parse_plan(resp2.text)
 
-                try:
-                    plan = self._get_plan_with_repair(history_messages, active_process_path=fg.process_path)
-                except ActionParseError as e:
-                    log.error("Model returned invalid JSON plan: %s", e)
-                    return
-                except httpx.HTTPStatusError as e:
-                    status = getattr(e.response, "status_code", None)
-                    if status in {429, 529}:
-                        retry_after = e.response.headers.get("retry-after") if e.response is not None else None
-                        wait_s = 10.0
-                        if retry_after:
-                            try:
-                                wait_s = max(wait_s, float(retry_after))
-                            except ValueError:
-                                pass
-                        log.warning("Rate limited by Anthropic (%s). Waiting %.1fs then retrying...", status, wait_s)
-                        # sleep in short chunks so Ctrl+C is responsive
-                        end_t = time.time() + wait_s
-                        while time.time() < end_t:
-                            if self._kill.triggered:
-                                log.warning("Kill switch triggered while waiting. Stopping.")
-                                return
-                            time.sleep(0.25)
-                        continue
-                    log.exception("HTTP error from Anthropic: %s", e)
-                    return
-                except Exception as e:
-                    log.exception("Failed to get plan: %s", e)
-                    return
+        except ActionParseError as e:
+            log.error("Model returned invalid JSON plan: %s", e)
+            return None
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429:
+                sleep_s = 8.0 + random.random() * 4.0
+                log.warning("Rate limited (429). Sleeping %.1fs…", sleep_s)
+                time.sleep(sleep_s)
+                return None
+            log.exception("VLM call failed: %s", e)
+            return None
 
-                if self._execute_plan(plan, step=step, screenshot_png=shot.png, observed_window=fg.title):
-                    return
+    # ── plan execution ───────────────────────────────────────────────────
 
-                if self._cfg.loop_interval_s:
-                    time.sleep(self._cfg.loop_interval_s)
+    def _execute_plan(self, plan: ParsedPlan, shot: Screenshot) -> bool:
+        """Execute actions.  Returns True if "stop" was reached."""
+        actions = plan.actions[:6]
+        log.info("Plan (%d actions): %s", len(actions), actions)
 
-            log.warning("Max steps reached (%d). Stopping.", self._cfg.max_steps)
-        except KeyboardInterrupt:
-            log.warning("Stopped by user (Ctrl+C).")
-            return
-
-    @staticmethod
-    def _is_uac_secure_desktop(process_path: str | None, window_title: str | None) -> bool:
-        if process_path and process_path.lower().endswith("\\consent.exe"):
-            return True
-        if window_title and "user account control" in window_title.lower():
-            return True
-        return False
-
-    @staticmethod
-    def _is_open_with_dialog(window_title: str | None, process_path: str | None) -> bool:
-        title = (window_title or "").lower()
-        keywords = (
-            "open with",
-            "how do you want to open",
-            "choose an app",
-            "choose an application",
-            "select an app",
-            "always use this app",
-        )
-        if any(k in title for k in keywords):
-            return True
-        if process_path:
-            p = process_path.lower().replace("/", "\\")
-            if p.endswith("\\openwith.exe"):
+        for a in actions:
+            if self._kill.triggered:
+                log.warning("Kill switch triggered mid-plan.")
                 return True
-            # Windows 11 often hosts this UI in system settings frame.
-            if p.endswith("\\applicationframehost.exe") or p.endswith("\\systemsettings.exe"):
-                if any(k in title for k in keywords):
-                    return True
+
+            self._state.recent_actions.append(a)
+            # Keep recent_actions bounded
+            if len(self._state.recent_actions) > 30:
+                self._state.recent_actions = self._state.recent_actions[-30:]
+
+            t = a["type"]
+
+            # ── stop ──
+            if t == "stop":
+                reason = a.get("reason", "")
+                log.info("STOP: %s", reason)
+                self._memory.append_event({"type": "stop", "reason": reason, "ts": int(time.time())})
+                self._update_overlay_simple(f"done: {reason}")
+                return True
+
+            # ── ask_user ──
+            if t == "ask_user":
+                choice = _prompt_user_choice(a["question"], a["options"])
+                self._state.human_notes.append(f"Q: {a['question']} → {choice}")
+                self._memory.append_event({
+                    "type": "ask_user", "question": a["question"],
+                    "choice": choice, "ts": int(time.time()),
+                })
+                return False  # re-capture after user input
+
+            if self._cfg.dry_run:
+                log.info("[dry-run] would execute: %s", a)
+                continue
+
+            # ── keyboard actions ──
+            if t == "type_text":
+                self._do_type_text(a["text"])
+            elif t == "key_press":
+                self._do_key_press(a["key"])
+            elif t == "hotkey":
+                self._do_hotkey(a["keys"])
+            elif t == "wait_ms":
+                time.sleep(a["ms"] / 1000.0)
+
+            # ── mouse actions ──
+            elif t == "mouse_click":
+                self._do_mouse_click(a, shot)
+            elif t == "mouse_scroll":
+                self._do_mouse_scroll(a, shot)
+
+            self._update_overlay_action(a)
+
         return False
+
+    # ── keyboard dispatch ────────────────────────────────────────────────
+
+    def _do_type_text(self, text: str) -> None:
+        if self._driver is not None:
+            if not self._driver.inject_text(text):
+                self._injector.type_text(text)  # fallback
+        else:
+            self._injector.type_text(text)
+
+    def _do_key_press(self, key: str) -> None:
+        # Kernel driver path would need scancode mapping; use user-mode for simplicity
+        self._injector.key_press(key)
+
+    def _do_hotkey(self, keys: list[str]) -> None:
+        self._injector.hotkey(keys)
+
+    # ── mouse dispatch ───────────────────────────────────────────────────
+
+    def _do_mouse_click(self, action: dict, shot: Screenshot) -> None:
+        sx, sy = int(action["x"]), int(action["y"])
+        button = action.get("button", "left")
+        clicks = action.get("clicks", 1)
+
+        nx, ny = self._screenshot_to_virtual(sx, sy, shot)
+        self._injector.mouse_move_smooth(nx, ny, steps=10, step_delay_s=0.003)
+        time.sleep(0.03)
+        self._injector.mouse_click(button, clicks=clicks)
+        log.info("mouse_click (%d,%d) → virtual (%.4f,%.4f) button=%s clicks=%d",
+                 sx, sy, nx, ny, button, clicks)
+
+    def _do_mouse_scroll(self, action: dict, shot: Screenshot) -> None:
+        sx, sy = int(action["x"]), int(action["y"])
+        direction = action.get("direction", "down")
+        scroll_clicks = action.get("clicks", 3)
+
+        nx, ny = self._screenshot_to_virtual(sx, sy, shot)
+        self._injector.mouse_move_smooth(nx, ny, steps=8, step_delay_s=0.003)
+        time.sleep(0.02)
+        delta = 120 * scroll_clicks * (1 if direction == "up" else -1)
+        self._injector.mouse_scroll(delta)
+        log.info("mouse_scroll (%d,%d) direction=%s clicks=%d", sx, sy, direction, scroll_clicks)
+
+    def _screenshot_to_virtual(self, sx: int, sy: int, shot: Screenshot) -> tuple[float, float]:
+        """Convert screenshot pixel coords → normalized virtual-desktop coords (0..1)."""
+        mon = shot.monitor or {}
+        mon_w = float(mon.get("width", shot.width))
+        mon_h = float(mon.get("height", shot.height))
+        shot_w = float(shot.width) or 1.0
+        shot_h = float(shot.height) or 1.0
+
+        # Scale screenshot pixel → actual monitor pixel
+        scale_x = mon_w / shot_w
+        scale_y = mon_h / shot_h
+        actual_x = float(mon.get("left", 0)) + sx * scale_x
+        actual_y = float(mon.get("top", 0)) + sy * scale_y
+
+        # Convert to virtual-desktop normalized
+        vs_left = float(mon.get("__virtual_screen_left", 0))
+        vs_top = float(mon.get("__virtual_screen_top", 0))
+        vs_w = float(mon.get("__virtual_screen_width", mon_w))
+        vs_h = float(mon.get("__virtual_screen_height", mon_h))
+
+        if vs_w <= 0:
+            vs_w = mon_w
+        if vs_h <= 0:
+            vs_h = mon_h
+
+        nx = (actual_x - vs_left) / vs_w
+        ny = (actual_y - vs_top) / vs_h
+        return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
+
+    # ── screenshot change detection ──────────────────────────────────────
+
+    @staticmethod
+    def _hash_screenshot(shot: Screenshot) -> str:
+        return hashlib.md5(shot.png).hexdigest()
+
+    def _did_screen_change(self, shot: Screenshot) -> bool:
+        if self._prev_screen_hash is None:
+            self._prev_screen_hash = self._hash_screenshot(shot)
+            return True
+        h = self._hash_screenshot(shot)
+        changed = h != self._prev_screen_hash
+        self._prev_screen_hash = h
+        return changed
+
+    # ── progressive backtracking ─────────────────────────────────────────
+
+    def _progressive_backtrack(self) -> None:
+        """Escalating recovery when the agent is stuck."""
+        self._backtrack_level += 1
+        level = self._backtrack_level
+
+        if level == 1:
+            log.info("Backtrack L1: pressing Esc")
+            self._injector.key_press("esc")
+            self._state.human_notes.append("AUTO-BACKTRACK L1: pressed Esc")
+
+        elif level == 2:
+            log.info("Backtrack L2: click neutral area + Esc")
+            self._injector.mouse_move_normalized(0.5, 0.5)
+            time.sleep(0.02)
+            self._injector.mouse_click("left")
+            time.sleep(0.3)
+            self._injector.key_press("esc")
+            self._state.human_notes.append("AUTO-BACKTRACK L2: clicked center + Esc")
+
+        elif level == 3:
+            log.info("Backtrack L3: instruct model to change strategy")
+            self._state.human_notes.append(
+                "AUTO-BACKTRACK L3: Your previous actions had NO effect. "
+                "You MUST try a COMPLETELY different approach now. "
+                "If mouse clicks aren't working, use keyboard shortcuts. "
+                "If keyboard isn't working, try clicking a different area. "
+                "Consider scrolling to find the element if it's not visible."
+            )
+            self._stale_count = 0  # let model try again
+
+        elif level == 4:
+            log.info("Backtrack L4: Alt+Tab and back")
+            self._injector.hotkey(["alt", "tab"])
+            time.sleep(0.8)
+            self._injector.hotkey(["alt", "tab"])
+            self._state.human_notes.append("AUTO-BACKTRACK L4: Alt+Tab cycle")
+            self._stale_count = 0
+
+        else:
+            log.info("Backtrack L5+: asking user for help")
+            if _is_interactive():
+                choice = _prompt_user_choice(
+                    "Agent is stuck. What should it do?",
+                    [
+                        "Give a text hint",
+                        "Press Esc and retry",
+                        "Try keyboard shortcuts instead",
+                        "Skip this and continue",
+                    ],
+                )
+                if "hint" in choice.lower():
+                    try:
+                        note = input("Hint: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        note = ""
+                    if note:
+                        self._state.human_notes.append(f"USER HINT: {note}")
+                        self._learning.add_tip(
+                            app=_detect_app_from_goal(self._cfg.goal),
+                            tip=note,
+                        )
+                elif "esc" in choice.lower():
+                    self._injector.key_press("esc")
+                elif "keyboard" in choice.lower():
+                    self._state.human_notes.append(
+                        "USER: use keyboard shortcuts instead of mouse"
+                    )
+                # Reset
+                self._stale_count = 0
+                self._backtrack_level = 0
+            else:
+                # Non-interactive: hard reset
+                self._injector.key_press("esc")
+                self._state.human_notes.append(
+                    "AUTO-BACKTRACK: stuck with no human available. Pressed Esc."
+                )
+                self._stale_count = 0
+                self._backtrack_level = 0
+
+    # ── overlay helpers ──────────────────────────────────────────────────
+
+    def _update_overlay_plan(self, plan: ParsedPlan, step: int) -> None:
+        if self._overlay is None:
+            return
+        meta = plan.meta or {}
+        self._overlay.update(OverlayState(
+            goal=self._cfg.goal,
+            step=step,
+            max_steps=self._cfg.max_steps,
+            mode=("dry-run" if self._cfg.dry_run else f"live/{self._injection_mode}"),
+            progress=str(meta.get("progress", "planning"))[:120],
+            estimated_total_steps=_int_or_none(meta.get("estimated_total_steps")),
+        ))
+
+    # ── built-in deterministic goal handler ─────────────────────────────
 
     def _try_handle_builtin_goal(self) -> bool:
-        """Handle a small set of deterministic goals without LLM/vision.
-
-        This prevents demos from failing due to UI focus, token limits, or model JSON issues.
-        """
-
         goal = self._cfg.goal.strip()
         lower = goal.lower()
 
@@ -244,7 +589,6 @@ class KeyboardVisionAgent:
 
     @staticmethod
     def _desktop_path() -> Path:
-        # Prefer OneDrive Desktop when present.
         candidate = Path(os.path.expanduser("~")) / "OneDrive" / "Desktop"
         if candidate.exists():
             return candidate
@@ -262,7 +606,6 @@ class KeyboardVisionAgent:
 
     @staticmethod
     def _extract_content(goal: str) -> str | None:
-        # Extract content inside quotes after the word content.
         match = re.search(r"content\s+['\"]([^'\"]+)['\"]", goal, flags=re.IGNORECASE)
         if match:
             return match.group(1)
@@ -271,277 +614,161 @@ class KeyboardVisionAgent:
             return match.group(1)
         return None
 
-    def _execute_plan(self, plan: ParsedPlan, *, step: int, screenshot_png: bytes, observed_window: str) -> bool:
-        actions = plan.actions[:6]
-        log.info("Plan: %s", actions)
-
-        executed: list[ActionExecutionRecord] = []
-        observed = f"Active window: {observed_window}" if observed_window else "Active window unknown"
-        step_success = True
-
-        for a in actions:
-            if self._kill.triggered:
-                log.warning("Kill switch triggered mid-plan. Stopping.")
-                step_success = False
-                break
-
-            duplicate = self._history.find_recent_duplicate(a, last_n_steps=2)
-            if duplicate:
-                duplicate_step, signature = duplicate
-                log.warning(
-                    "Potential repeat detected: action '%s' already succeeded in Step %d.",
-                    signature,
-                    duplicate_step,
-                )
-
-            self._state.recent_actions.append(a)
-
-            start_t = time.perf_counter()
-            timestamp_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            error: str | None = None
-            success = True
-
-            t = a["type"]
-            if t == "stop":
-                log.info("Stop: %s", a.get("reason", ""))
-                duration_ms = int((time.perf_counter() - start_t) * 1000)
-                executed.append(
-                    ActionExecutionRecord(
-                        step=step,
-                        action=a,
-                        success=True,
-                        duration_ms=duration_ms,
-                        error=None,
-                        timestamp_utc=timestamp_utc,
-                    )
-                )
-                self._history.append_step(
-                    step=step,
-                    observed=observed,
-                    planned_actions=actions,
-                    executed_actions=executed,
-                    success=True,
-                    screenshot_png=screenshot_png,
-                )
-                return True
-
-            if self._cfg.dry_run:
-                duration_ms = int((time.perf_counter() - start_t) * 1000)
-                executed.append(
-                    ActionExecutionRecord(
-                        step=step,
-                        action=a,
-                        success=True,
-                        duration_ms=duration_ms,
-                        error=None,
-                        timestamp_utc=timestamp_utc,
-                    )
-                )
-                continue
-
-            # Conservative dedup: only skip a narrow set of loop-causing repeats.
-            # Never skip common navigation keys like Enter/Tab/Arrows.
-            if duplicate and duplicate_step == step - 1 and self._should_dedup_skip(a):
-                duration_ms = int((time.perf_counter() - start_t) * 1000)
-                executed.append(
-                    ActionExecutionRecord(
-                        step=step,
-                        action=a,
-                        success=True,
-                        duration_ms=duration_ms,
-                        error="dedup_skipped",
-                        timestamp_utc=timestamp_utc,
-                    )
-                )
-                log.info("Dedup skipped action in step %d: %s", step, a)
-                continue
-
-            try:
-                if t == "type_text":
-                    self._injector.type_text(a["text"])
-                elif t == "key_press":
-                    self._injector.key_press(a["key"])
-                elif t == "hotkey":
-                    self._injector.hotkey(a["keys"])
-                elif t == "wait_ms":
-                    time.sleep(a["ms"] / 1000.0)
-                else:
-                    success = False
-                    error = f"Unknown action type: {t}"
-            except Exception as exc:
-                success = False
-                error = str(exc)
-                step_success = False
-
-            duration_ms = int((time.perf_counter() - start_t) * 1000)
-            executed.append(
-                ActionExecutionRecord(
-                    step=step,
-                    action=a,
-                    success=success,
-                    duration_ms=duration_ms,
-                    error=error,
-                    timestamp_utc=timestamp_utc,
-                )
-            )
-
-            if not success:
-                log.warning("Action failed: %s error=%s", a, error)
-                break
-
-        self._history.append_step(
-            step=step,
-            observed=observed,
-            planned_actions=actions,
-            executed_actions=executed,
-            success=step_success,
-            screenshot_png=screenshot_png,
-        )
-
-        return False
-
-    def _get_plan_with_repair(self, history_messages: list[dict], *, active_process_path: str | None) -> ParsedPlan:
-        resp = self._anthropic.create_message_with_history(
-            system=SYSTEM_PROMPT,
-            messages=history_messages,
-            max_tokens=self._cfg.max_tokens,
-            temperature=self._cfg.temperature,
-        )
-        try:
-            plan = parse_plan(resp.text)
-            plan = self._guard_premature_stop(
-                plan,
-                active_process_path=active_process_path,
-                history_messages=history_messages,
-                previous_model_text=resp.text,
-            )
-            return plan
-        except ActionParseError as exc:
-            validation_error = str(exc)
-            log.warning("Invalid plan from model (%s). Attempting repair...", validation_error)
-
-        allowed = ", ".join(sorted(ALLOWED_ACTION_TYPES))
-        repair_text = (
-            "Your previous response was invalid for this agent.\n"
-            f"Validation error: {validation_error}\n"
-            f"Allowed action types: {allowed}.\n"
-            "Rules: keyboard-only. Do NOT output mouse actions (click/double_click/triple_click).\n"
-            "Return ONLY valid JSON matching the schema, with at most 6 actions.\n\n"
-            "Invalid response you must repair:\n"
-            + resp.text
-        )
-
-        repaired_messages = list(history_messages)
-        repaired_messages.append({"role": "user", "content": [{"type": "text", "text": repair_text}]})
-
-        resp2 = self._anthropic.create_message_with_history(
-            system=SYSTEM_PROMPT,
-            messages=repaired_messages,
-            max_tokens=self._cfg.max_tokens,
-            temperature=0.0,
-        )
-        plan2 = parse_plan(resp2.text)
-        return self._guard_premature_stop(
-            plan2,
-            active_process_path=active_process_path,
-            history_messages=repaired_messages,
-            previous_model_text=resp2.text,
-        )
-
-    def _guard_premature_stop(
-        self,
-        plan: ParsedPlan,
-        *,
-        active_process_path: str | None,
-        history_messages: list[dict],
-        previous_model_text: str,
-    ) -> ParsedPlan:
-        if not plan.actions:
-            return plan
-        first = plan.actions[0]
-        if str(first.get("type", "")).lower() != "stop":
-            return plan
-
-        if not self._goal_requires_verification(self._cfg.goal):
-            return plan
-
-        desktop_target = self._extract_desktop_target_path(self._cfg.goal)
-        file_exists = bool(desktop_target and desktop_target.exists())
-        explorer_foreground = self._is_explorer_foreground(active_process_path)
-
-        # If the goal mentions verification/opening Explorer, refuse to stop unless:
-        # - the file exists on disk
-        # - and Explorer is currently foreground (visual verification step)
-        if file_exists and explorer_foreground:
-            return plan
-
-        explain = (
-            "You returned stop but verification is NOT satisfied yet.\n"
-            f"Goal requires verification: {self._cfg.goal}\n"
-            f"Desktop target: {str(desktop_target) if desktop_target else '(unknown)'}\n"
-            f"File exists on disk: {file_exists}\n"
-            f"Foreground is Explorer: {explorer_foreground}\n\n"
-            "Return the NEXT keyboard-only actions to complete/verify the goal. "
-            "If the file does not exist, create it. If Explorer is not foreground, open File Explorer and navigate/select the file. "
-            "Return ONLY valid JSON with allowed action types."
-        )
-
-        repair_messages = list(history_messages)
-        repair_messages.append({"role": "user", "content": [{"type": "text", "text": explain}]})
-        resp = self._anthropic.create_message_with_history(
-            system=SYSTEM_PROMPT,
-            messages=repair_messages,
-            max_tokens=self._cfg.max_tokens,
-            temperature=0.0,
-        )
-        try:
-            return parse_plan(resp.text)
-        except ActionParseError:
-            # As a last resort, keep the original plan (better than crashing); execution loop will stop.
-            log.warning("Stop-guard repair also produced invalid JSON; using original model output.")
-            log.debug("Raw repair text:\n%s", resp.text)
-            return plan
+    # ── dialog detection ───────────────────────────────────────────────
 
     @staticmethod
-    def _goal_requires_verification(goal: str) -> bool:
-        g = goal.lower()
-        return any(w in g for w in ("verify", "exists", "exist", "file explorer", "open file explorer", "open explorer"))
-
-    @staticmethod
-    def _is_explorer_foreground(active_process_path: str | None) -> bool:
-        if not active_process_path:
-            return False
-        return active_process_path.lower().endswith("\\explorer.exe") or active_process_path.lower().endswith("/explorer.exe")
-
-    @staticmethod
-    def _extract_desktop_target_path(goal: str) -> Path | None:
-        # Try to extract a filename like 'test_report.txt' or "foo.xlsx".
-        patterns = [
-            r"['\"]([^'\"]+\.[a-z0-9]{1,6})['\"]",
-            r"\b([A-Za-z0-9_\- ]+\.[A-Za-z0-9]{1,6})\b",
-        ]
-        filename: str | None = None
-        for pat in patterns:
-            match = re.search(pat, goal)
-            if match:
-                filename = match.group(1).strip()
-                break
-        if not filename:
-            return None
-
-        # If the goal explicitly mentions desktop, resolve to desktop path; else still try desktop as best effort.
-        desktop = Path(os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop"))
-        if not desktop.exists():
-            desktop = Path(os.path.join(os.path.expanduser("~"), "Desktop"))
-        return desktop / filename
-
-    @staticmethod
-    def _should_dedup_skip(action: dict) -> bool:
-        t = str(action.get("type", "")).lower()
-        if t in {"type_text", "hotkey"}:
+    def _is_uac_secure_desktop(process_path: str | None, window_title: str | None) -> bool:
+        if process_path and process_path.lower().replace("/", "\\").endswith("\\consent.exe"):
             return True
-        if t == "key_press":
-            key = str(action.get("key", "")).strip().lower()
-            return key in {"win"}
+        if window_title and "user account control" in window_title.lower():
+            return True
         return False
+
+    @staticmethod
+    def _is_open_with_dialog(window_title: str | None, process_path: str | None) -> bool:
+        title = (window_title or "").lower()
+        keywords = (
+            "open with",
+            "how do you want to open",
+            "choose an app",
+            "choose an application",
+            "select an app",
+            "always use this app",
+        )
+        if any(k in title for k in keywords):
+            return True
+        if process_path:
+            p = process_path.lower().replace("/", "\\")
+            if p.endswith("\\openwith.exe"):
+                return True
+            if p.endswith("\\applicationframehost.exe") or p.endswith("\\systemsettings.exe"):
+                if any(k in title for k in keywords):
+                    return True
+        return False
+
+    def _update_overlay_action(self, action: dict) -> None:
+        if self._overlay is None:
+            return
+        self._overlay.update(OverlayState(
+            goal=self._cfg.goal,
+            step=self._current_step,
+            max_steps=self._cfg.max_steps,
+            mode=("dry-run" if self._cfg.dry_run else f"live/{self._injection_mode}"),
+            progress="executing",
+            last_action=_action_summary(action),
+        ))
+
+    def _update_overlay_simple(self, progress: str) -> None:
+        if self._overlay is None:
+            return
+        self._overlay.update(OverlayState(
+            goal=self._cfg.goal,
+            step=self._current_step,
+            max_steps=self._cfg.max_steps,
+            mode=("dry-run" if self._cfg.dry_run else f"live/{self._injection_mode}"),
+            progress=progress,
+        ))
+
+
+# ── utility functions ────────────────────────────────────────────────────────
+
+def _plan_signature(plan: ParsedPlan) -> str:
+    """Quick fingerprint of a plan for repetition detection."""
+    parts: list[str] = []
+    for a in plan.actions[:6]:
+        t = a.get("type", "")
+        key = (
+            a.get("key")
+            or a.get("text", "")[:20]
+            or str(a.get("keys"))
+            or f"{a.get('x')},{a.get('y')}"
+        )
+        parts.append(f"{t}:{key}")
+    return "|".join(parts)
+
+
+def _detect_app(title: str, process_path: str | None) -> str:
+    """Guess which app is active from window title / process path."""
+    t = (title or "").lower()
+    p = (process_path or "").lower()
+    if "chrome" in p or "chrome" in t:
+        if "gmail" in t or "inbox" in t:
+            return "gmail"
+        return "chrome"
+    if "spotify" in p or "spotify" in t:
+        return "spotify"
+    if "notepad" in p:
+        return "notepad"
+    if "explorer" in p:
+        return "explorer"
+    if "code" in p:
+        return "vscode"
+    return "unknown"
+
+
+def _detect_app_from_goal(goal: str) -> str:
+    g = (goal or "").lower()
+    if "gmail" in g or "email" in g or "mail" in g:
+        return "gmail"
+    if "chrome" in g:
+        return "chrome"
+    if "spotify" in g:
+        return "spotify"
+    if "notepad" in g:
+        return "notepad"
+    return "general"
+
+
+def _action_summary(action: dict) -> str:
+    t = action.get("type", "")
+    if t == "type_text":
+        return f"type: {str(action.get('text', ''))[:40]}"
+    if t == "key_press":
+        return f"key: {action.get('key')}"
+    if t == "hotkey":
+        return f"hotkey: {action.get('keys')}"
+    if t == "mouse_click":
+        return f"click ({action.get('x')},{action.get('y')}) {action.get('button')}"
+    if t == "mouse_scroll":
+        return f"scroll ({action.get('x')},{action.get('y')}) {action.get('direction')}"
+    if t == "wait_ms":
+        return f"wait {action.get('ms')}ms"
+    return t
+
+
+def _int_or_none(v: object) -> int | None:
+    try:
+        if v is None:
+            return None
+        n = int(v)  # type: ignore[arg-type]
+        return n if n > 0 else None
+    except Exception:
+        return None
+
+
+def _is_interactive() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def _prompt_user_choice(question: str, options: list[str]) -> str:
+    print(f"\nAIK needs your choice:\n{question}")
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}. {opt}")
+    while True:
+        try:
+            s = input(f"Choose 1-{len(options)} (or type your own): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return options[0]
+        if not s:
+            return options[0]
+        if s.isdigit():
+            idx = int(s)
+            if 1 <= idx <= len(options):
+                return options[idx - 1]
+        return s
+
+
 
