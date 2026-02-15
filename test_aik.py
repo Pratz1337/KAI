@@ -35,6 +35,7 @@ def test_history_memory():
             screenshot_png=b"\x89PNG\r\n\x1a\n" + (b"0" * 32),
             active_window_title="Untitled - Notepad",
             active_process_path="C:/Windows/System32/notepad.exe",
+            user_text="Context: {}",
         )
         assert isinstance(messages, list) and messages
         assert messages[0]["role"] == "user"

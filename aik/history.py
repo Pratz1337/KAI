@@ -158,6 +158,7 @@ class ConversationHistory:
         screenshot_png: bytes,
         active_window_title: str,
         active_process_path: str | None,
+        user_text: str | None = None,
     ) -> list[dict]:
         messages: list[dict] = [
             {
@@ -203,6 +204,8 @@ class ConversationHistory:
             active_window_title=active_window_title,
             active_process_path=active_process_path,
         )
+        if user_text:
+            current_context_text = current_context_text + "\n\nUser prompt/context:\n" + user_text
         current_content = [
             {"type": "text", "text": current_context_text},
             self._image_block(screenshot_png),

@@ -29,6 +29,7 @@ from .driver_bridge import DriverBridge
 from .input_injector import InputInjector
 from .kill_switch import KillSwitch
 from .learning import LearningGraph
+from .history import ActionExecutionRecord, ConversationHistory
 from .memory import Memory
 from .overlay import Overlay, OverlayState
 from .prompt import PromptContext, SYSTEM_PROMPT, build_user_prompt
@@ -89,6 +90,7 @@ class KeyboardVisionAgent:
         self._last_shot_height = 0
         self._memory = Memory.load(cfg.memory_path)
         self._learning = LearningGraph.load(cfg.learning_path)
+        self._history = ConversationHistory(cfg.goal)
 
         # Screenshot-change detection
         self._prev_screen_hash: str | None = None
@@ -213,8 +215,16 @@ class KeyboardVisionAgent:
             )
             user_prompt = build_user_prompt(ctx)
 
-            # 8. Call VLM
-            plan = self._call_vlm(shot, user_prompt, step)
+            history_messages = self._history.build_messages_for_decision(
+                step=step,
+                screenshot_png=shot.png,
+                active_window_title=fg.title,
+                active_process_path=fg.process_path,
+                user_text=user_prompt,
+            )
+
+            # 8. Call VLM (history-aware)
+            plan = self._call_vlm(history_messages, shot, step)
             if plan is None:
                 continue  # retry (rate-limit) or bail
 
@@ -243,7 +253,7 @@ class KeyboardVisionAgent:
                 continue
 
             # 11. Execute plan
-            if self._execute_plan(plan, shot):
+            if self._execute_plan(plan, shot, active_window_title=fg.title, active_process_path=fg.process_path):
                 # Record success
                 self._learning.record_success(
                     app=app_name,
@@ -265,12 +275,11 @@ class KeyboardVisionAgent:
 
     # ── VLM call ─────────────────────────────────────────────────────────
 
-    def _call_vlm(self, shot: Screenshot, user_prompt: str, step: int) -> ParsedPlan | None:
+    def _call_vlm(self, history_messages: list[dict], shot: Screenshot, step: int) -> ParsedPlan | None:
         try:
-            resp = self._anthropic.create_message(
+            resp = self._anthropic.create_message_with_history(
                 system=SYSTEM_PROMPT,
-                user_text=user_prompt,
-                image_png=shot.png,
+                messages=history_messages,
                 max_tokens=self._cfg.max_tokens,
                 temperature=self._cfg.temperature,
             )
@@ -283,10 +292,11 @@ class KeyboardVisionAgent:
                     "Return corrected JSON only matching the schema.\n\n"
                     f"Original response:\n{resp.text or ''}"
                 )
-                resp2 = self._anthropic.create_message(
+                repaired_messages = list(history_messages)
+                repaired_messages.append({"role": "user", "content": [{"type": "text", "text": repair}]})
+                resp2 = self._anthropic.create_message_with_history(
                     system=SYSTEM_PROMPT,
-                    user_text=repair,
-                    image_png=shot.png,
+                    messages=repaired_messages,
                     max_tokens=self._cfg.max_tokens,
                     temperature=max(0.0, min(0.3, self._cfg.temperature)),
                 )
@@ -307,15 +317,39 @@ class KeyboardVisionAgent:
 
     # ── plan execution ───────────────────────────────────────────────────
 
-    def _execute_plan(self, plan: ParsedPlan, shot: Screenshot) -> bool:
+    def _execute_plan(
+        self,
+        plan: ParsedPlan,
+        shot: Screenshot,
+        *,
+        active_window_title: str,
+        active_process_path: str | None,
+    ) -> bool:
         """Execute actions.  Returns True if "stop" was reached."""
         actions = plan.actions[:6]
         log.info("Plan (%d actions): %s", len(actions), actions)
 
+        step = self._current_step
+        observed = ""
+        if plan.meta and isinstance(plan.meta.get("observation"), str):
+            observed = str(plan.meta.get("observation", "")).strip()
+        if not observed:
+            observed = f"Active window: {active_window_title}" if active_window_title else "Active window unknown"
+
+        executed: list[ActionExecutionRecord] = []
+        step_success = True
+        stop_reached = False
+        ask_user_break = False
+
         for a in actions:
             if self._kill.triggered:
                 log.warning("Kill switch triggered mid-plan.")
-                return True
+                step_success = False
+                break
+
+            dup = self._history.check_duplicate_action(a, last_n_steps=3)
+            if dup:
+                log.warning("%s", dup)
 
             self._state.recent_actions.append(a)
             # Keep recent_actions bounded
@@ -324,13 +358,30 @@ class KeyboardVisionAgent:
 
             t = a["type"]
 
+            start_t = time.perf_counter()
+            timestamp_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            success = True
+            error: str | None = None
+
             # ── stop ──
             if t == "stop":
                 reason = a.get("reason", "")
                 log.info("STOP: %s", reason)
                 self._memory.append_event({"type": "stop", "reason": reason, "ts": int(time.time())})
                 self._update_overlay_simple(f"done: {reason}")
-                return True
+                stop_reached = True
+                duration_ms = int((time.perf_counter() - start_t) * 1000)
+                executed.append(
+                    ActionExecutionRecord(
+                        step=step,
+                        action=a,
+                        success=True,
+                        duration_ms=duration_ms,
+                        error=None,
+                        timestamp_utc=timestamp_utc,
+                    )
+                )
+                break
 
             # ── ask_user ──
             if t == "ask_user":
@@ -340,31 +391,91 @@ class KeyboardVisionAgent:
                     "type": "ask_user", "question": a["question"],
                     "choice": choice, "ts": int(time.time()),
                 })
-                return False  # re-capture after user input
+                duration_ms = int((time.perf_counter() - start_t) * 1000)
+                executed.append(
+                    ActionExecutionRecord(
+                        step=step,
+                        action=a,
+                        success=True,
+                        duration_ms=duration_ms,
+                        error=None,
+                        timestamp_utc=timestamp_utc,
+                    )
+                )
+                ask_user_break = True
+                break  # re-capture after user input
 
             if self._cfg.dry_run:
                 log.info("[dry-run] would execute: %s", a)
+                duration_ms = int((time.perf_counter() - start_t) * 1000)
+                executed.append(
+                    ActionExecutionRecord(
+                        step=step,
+                        action=a,
+                        success=True,
+                        duration_ms=duration_ms,
+                        error=None,
+                        timestamp_utc=timestamp_utc,
+                    )
+                )
                 continue
 
-            # ── keyboard actions ──
-            if t == "type_text":
-                self._do_type_text(a["text"])
-            elif t == "key_press":
-                self._do_key_press(a["key"])
-            elif t == "hotkey":
-                self._do_hotkey(a["keys"])
-            elif t == "wait_ms":
-                time.sleep(a["ms"] / 1000.0)
+            try:
+                # ── keyboard actions ──
+                if t == "type_text":
+                    self._do_type_text(a["text"])
+                elif t == "key_press":
+                    self._do_key_press(a["key"])
+                elif t == "hotkey":
+                    self._do_hotkey(a["keys"])
+                elif t == "wait_ms":
+                    time.sleep(a["ms"] / 1000.0)
 
-            # ── mouse actions ──
-            elif t == "mouse_click":
-                self._do_mouse_click(a, shot)
-            elif t == "mouse_scroll":
-                self._do_mouse_scroll(a, shot)
+                # ── mouse actions ──
+                elif t == "mouse_click":
+                    self._do_mouse_click(a, shot)
+                elif t == "mouse_scroll":
+                    self._do_mouse_scroll(a, shot)
+            except Exception as exc:
+                success = False
+                error = str(exc)
+                step_success = False
+                log.warning("Action execution failed: %s error=%s", a, error)
 
             self._update_overlay_action(a)
 
-        return False
+            duration_ms = int((time.perf_counter() - start_t) * 1000)
+            executed.append(
+                ActionExecutionRecord(
+                    step=step,
+                    action=a,
+                    success=success,
+                    duration_ms=duration_ms,
+                    error=error,
+                    timestamp_utc=timestamp_utc,
+                )
+            )
+
+            if not success:
+                break
+
+        # Persist step memory for next decision.
+        try:
+            self._history.append_step(
+                step=step,
+                observed=observed,
+                planned_actions=actions,
+                executed_actions=executed,
+                success=step_success,
+                screenshot_png=shot.png,
+            )
+        except Exception as exc:
+            log.debug("Failed to append history step: %s", exc)
+
+        if ask_user_break:
+            return False
+
+        return stop_reached
 
     # ── keyboard dispatch ────────────────────────────────────────────────
 
