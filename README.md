@@ -48,6 +48,14 @@ Live typing:
 python main.py --goal "In the currently focused app, type: Hello World and press Enter"
 ```
 
+If you want to type into **elevated** apps (e.g., an Administrator terminal), start your terminal as Admin or use:
+
+```powershell
+python main.py --elevate --goal "Type: Hello from elevated context"
+```
+
+Note: this still cannot interact with the UAC secure desktop / login screen.
+
 Interactive terminal mode (re-enter goals without retyping full command):
 
 ```powershell
