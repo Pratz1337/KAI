@@ -35,6 +35,7 @@ A Windows-based AI agent that uses **Claude Vision (Haiku 4.5)** to understand y
 - **Kill switch**: Press `Ctrl+Alt+Backspace` to stop immediately
 - **User-mode injection**: Works with most applications via SendInput
 - **Kernel driver support** (optional): For bypassing UIPI restrictions
+- **History-aware memory**: Persists step-by-step execution history (with screenshot context), summarizes older steps, and avoids immediate repeat-loops
 
 ## Requirements
 
@@ -87,6 +88,32 @@ Note: Elevation still cannot interact with the UAC secure desktop or login scree
 python tools/interactive_run.py
 ```
 
+## Voice Terminal (Multilingual)
+
+You can run the voice-to-terminal utility with multilingual speech recognition.
+
+```powershell
+python tools/voice_type_terminal.py --provider sarvam --run-command --continuous --languages "en-IN,hi-IN,ta-IN"
+```
+
+Enable AI fallback for natural Hindi/Hinglish instructions:
+
+```powershell
+python tools/voice_type_terminal.py --provider sarvam --run-command --continuous --languages "en-IN,hi-IN" --ai-command-map
+```
+
+For multi-step spoken tasks (for example, "open excel then type data save and email"), the tool now delegates to the main agent automatically:
+
+```powershell
+python tools/voice_type_terminal.py --provider sarvam --run-command --continuous --delegate-to-agent
+```
+
+Single-language usage:
+
+```powershell
+python tools/voice_type_terminal.py --provider google --run-command --language "en-US"
+```
+
 ## Command-line Options
 
 | Option | Default | Description |
@@ -125,6 +152,15 @@ The AI returns JSON with keyboard actions:
 | `hotkey` | `keys` | Press key combo (["ctrl", "c"]) |
 | `wait_ms` | `ms` | Wait milliseconds (0-60000) |
 | `stop` | `reason` | Stop the agent |
+
+## History-Aware Agent Memory
+
+The agent maintains an internal conversation history so it can remember what it already did across steps:
+
+- Keeps the original goal pinned
+- Stores per-step memory (observations, planned actions, executed actions, success/failure, timestamps)
+- Summarizes older steps to avoid token blowups (keeps recent steps with screenshots)
+- Performs conservative dedup (skips immediate repeat actions that just succeeded in the prior step)
 
 ## Project Structure
 

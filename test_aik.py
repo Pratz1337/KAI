@@ -10,7 +10,7 @@ def test_imports():
     print("=" * 50)
     print("Testing imports...")
     try:
-        from aik import agent, anthropic_client, capture, driver_bridge
+        from aik import agent, anthropic_client, capture, driver_bridge, history
         from aik.actions import parse_plan
         from aik.prompt import SYSTEM_PROMPT, build_user_prompt, PromptContext
         from aik.kill_switch import KillSwitch
@@ -20,6 +20,29 @@ def test_imports():
         return True
     except Exception as e:
         print(f"✗ Import failed: {e}")
+        return False
+
+
+def test_history_memory():
+    print("\n" + "=" * 50)
+    print("Testing history/memory system...")
+    try:
+        from aik.history import ConversationHistory
+
+        hist = ConversationHistory("Open Notepad and type hello")
+        messages = hist.build_messages_for_decision(
+            step=1,
+            screenshot_png=b"\x89PNG\r\n\x1a\n" + (b"0" * 32),
+            active_window_title="Untitled - Notepad",
+            active_process_path="C:/Windows/System32/notepad.exe",
+        )
+        assert isinstance(messages, list) and messages
+        assert messages[0]["role"] == "user"
+        print("✓ ConversationHistory builds messages")
+        print(f"  Messages count: {len(messages)}")
+        return True
+    except Exception as e:
+        print(f"✗ History/memory failed: {e}")
         return False
 
 
@@ -150,6 +173,10 @@ def test_anthropic_client():
         print(f"✓ Anthropic client initialized")
         print(f"  Model: {model}")
         print(f"  API key: {api_key[:10]}...{api_key[-4:]}")
+
+        # Sanity-check new history method exists
+        assert hasattr(client, "create_message_with_history")
+        print("✓ History-aware API method present")
         return True
     except Exception as e:
         print(f"✗ Anthropic client setup failed: {e}")
@@ -202,6 +229,7 @@ def main():
     
     tests = [
         ("Imports", test_imports),
+        ("History/Memory", test_history_memory),
         ("Screen Capture", test_screen_capture),
         ("Window Context", test_window_context),
         ("Action Parser", test_action_parser),

@@ -32,6 +32,11 @@ Rules:
 - Prefer hotkeys (e.g. Alt+F, Ctrl+L) over long navigation when obvious.
 - If you're done or blocked, return a single stop action.
 - Do NOT ask for permissions or attempt to bypass security prompts. Only act within normal desktop apps.
+- Keyboard-only means NO mouse actions: never output click/double_click/triple_click.
+- Never invent new action types outside the schema.
+- Do NOT claim "completed" unless the CURRENT screenshot shows clear evidence the goal is done.
+- If completion requires verification (e.g., "verify it exists"), perform the verification steps (like opening File Explorer and showing the file) before returning stop.
+- For file verification, do NOT open the file (which may trigger an "Open with" dialog). Only select/highlight it in File Explorer.
 """
 
 

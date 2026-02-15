@@ -5,6 +5,7 @@ __all__ = [
     "capture",
     "driver_bridge",
     "elevation",
+    "history",
     "input_injector",
     "kill_switch",
     "logging_setup",
