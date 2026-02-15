@@ -73,12 +73,14 @@ def _contains_any(text: str, needles: list[str]) -> bool:
 
 
 class ConversationHistory:
-    def __init__(self, goal: str, *, keep_recent_steps: int = 6) -> None:
+    def __init__(self, goal: str, *, keep_recent_steps: int = 10) -> None:
         self.goal = goal
         self.keep_recent_steps = max(2, keep_recent_steps)
         self._task_message = self._build_initial_task_message(goal)
         self._steps: list[StepMemory] = []
         self._progress = ProgressChecklist(tasks=self._infer_subtasks(goal))
+        # Persistent log of ALL actions ever executed (never trimmed by keep_recent_steps)
+        self._action_log: list[str] = []
 
     @property
     def steps(self) -> list[StepMemory]:
@@ -235,28 +237,69 @@ class ConversationHistory:
         self._steps.append(memory)
         self._update_progress(memory)
 
+        # Append to persistent action log (never trimmed)
+        for rec in executed_actions:
+            self._action_log.append(self._summarize_action_record(rec, step))
+
+    @staticmethod
+    def _summarize_action_record(rec: ActionExecutionRecord, step: int) -> str:
+        """One-line human-readable summary of an executed action."""
+        a = rec.action
+        t = str(a.get("type", ""))
+        ok = "✓" if rec.success else "✗"
+        if t == "type_text":
+            detail = f'typed "{str(a.get("text", ""))[:50]}"'
+        elif t == "key_press":
+            detail = f'pressed {a.get("key")}'
+        elif t == "hotkey":
+            detail = f'hotkey {a.get("keys")}'
+        elif t == "mouse_click":
+            detail = f'clicked ({a.get("x")},{a.get("y")}) {a.get("button", "left")}'
+        elif t == "mouse_scroll":
+            detail = f'scrolled {a.get("direction")} at ({a.get("x")},{a.get("y")})'
+        elif t == "stop":
+            detail = f'stop: {str(a.get("reason", ""))[:50]}'
+        elif t == "wait_ms":
+            detail = f'waited {a.get("ms")}ms'
+        elif t == "ask_user":
+            detail = f'asked: {str(a.get("question", ""))[:40]}'
+        else:
+            detail = t
+        return f"Step {step}: {ok} {detail}"
+
     def _update_progress(self, memory: StepMemory) -> None:
         joined = " ".join(
             [memory.observed]
             + [json.dumps(a.action, ensure_ascii=False) for a in memory.executed_actions]
         ).lower()
         mapping = {
-            "Open Excel": ["excel", "start excel"],
-            "Create document content": ["type_text", "typed", "cell", "workbook"],
-            "Save document": ["ctrl+s", "save", "saved"],
+            "Open Excel": ["excel", "start excel", "excel.exe"],
+            "Create document content": ["type_text", "typed", "cell", "workbook", "entered data"],
+            "Save document": ["ctrl+s", "save", "saved", "ctrl\"+\"s"],
             "Close Excel": ["alt+f4", "close excel", "closed excel"],
-            "Open browser": ["chrome", "firefox", "edge", "browser", "ctrl+l"],
-            "Navigate to Gmail": ["gmail", "mail.google.com"],
-            "Compose email": ["compose", "new message"],
-            "Attach document": ["attach", "attachment", "paperclip"],
-            "Send email": ["send", "sent"],
-            "Open required application": ["start", "open", "launched"],
-            "Complete core task steps": ["type", "fill", "write", "entered"],
-            "Finalize and confirm completion": ["save", "done", "completed", "stop"],
+            "Open browser": ["chrome", "firefox", "edge", "browser", "ctrl+l", "chrome.exe"],
+            "Navigate to Gmail": ["gmail", "mail.google.com", "inbox"],
+            "Compose email": ["compose", "new message", "compose button"],
+            "Attach document": ["attach", "attachment", "paperclip", "attach file"],
+            "Send email": ["send", "sent", "message sent"],
+            "Open required application": ["start", "open", "launched", "running"],
+            "Complete core task steps": ["type", "fill", "write", "entered", "typed"],
+            "Finalize and confirm completion": ["save", "done", "completed", "stop", "verified"],
         }
         for task in self._progress.tasks:
             hints = mapping.get(task, [])
             if any(h in joined for h in hints):
+                self._progress.completed.add(task)
+
+    def update_checklist_from_vlm(self, progress_text: str) -> None:
+        """Allow the VLM's progress field to mark checklist items complete."""
+        if not progress_text:
+            return
+        pl = progress_text.lower()
+        for task in self._progress.tasks:
+            if task.lower() in pl or any(
+                word in pl for word in task.lower().split() if len(word) > 3
+            ):
                 self._progress.completed.add(task)
 
     def _render_step_user_memory(self, memory: StepMemory) -> str:
@@ -288,13 +331,15 @@ class ConversationHistory:
             f"Summary of Steps 1-{old[-1].step} (screenshots omitted to save tokens):",
         ]
         for step in old:
-            action_names = [str(a.get("type", "")) for a in step.planned_actions]
-            action_preview = ", ".join(action_names[:4]) if action_names else "none"
+            action_details: list[str] = []
+            for rec in step.executed_actions:
+                action_details.append(self._summarize_action_record(rec, step.step))
+            detail_str = "; ".join(action_details) if action_details else "no actions"
             status = "success" if step.success else "partial/failure"
             lines.append(
-                f"- Step {step.step}: observed '{step.observed[:120]}', actions [{action_preview}], status={status}."
+                f"- Step {step.step} [{status}]: {detail_str}"
             )
-        lines.append("Checklist so far:\n" + self._progress.render())
+        lines.append("\nChecklist so far:\n" + self._progress.render())
         return "\n".join(lines)
 
     def _build_current_context_message(
@@ -309,9 +354,13 @@ class ConversationHistory:
             "active_window_title": active_window_title,
             "active_process_path": active_process_path,
             "checklist": self._progress.render(),
+            "completed_actions_history": self._action_log[-40:],
             "instruction": (
-                "Review all prior memory and checklist. Do not repeat already-completed actions. "
-                "Return only the NEXT small set of actions (max 6). Return stop when complete."
+                "CRITICAL: Review the completed_actions_history list above. "
+                "Every action listed there has ALREADY been executed. "
+                "DO NOT repeat any action that already succeeded (marked ✓). "
+                "Only return the NEXT small set of actions (max 6) that move "
+                "toward the goal. Return stop when the goal is visually confirmed complete."
             ),
             "completion_rule": (
                 "Only return stop if the CURRENT screenshot provides clear evidence the goal is complete. "

@@ -650,13 +650,18 @@ class KeyboardVisionAgent:
         if self._overlay is None:
             return
         meta = plan.meta or {}
+        progress_text = str(meta.get("progress", "planning"))[:120]
+        # Let the VLM's progress text update the history checklist
+        self._history.update_checklist_from_vlm(progress_text)
         self._overlay.update(OverlayState(
             goal=self._cfg.goal,
             step=step,
             max_steps=self._cfg.max_steps,
             mode=("dry-run" if self._cfg.dry_run else f"live/{self._injection_mode}"),
-            progress=str(meta.get("progress", "planning"))[:120],
+            progress=progress_text,
             estimated_total_steps=_int_or_none(meta.get("estimated_total_steps")),
+            checklist_tasks=tuple(self._history.progress.tasks),
+            checklist_completed=frozenset(self._history.progress.completed),
         ))
 
     # ── built-in deterministic goal handler ─────────────────────────────
@@ -767,6 +772,8 @@ class KeyboardVisionAgent:
             mode=("dry-run" if self._cfg.dry_run else f"live/{self._injection_mode}"),
             progress="executing",
             last_action=_action_summary(action),
+            checklist_tasks=tuple(self._history.progress.tasks),
+            checklist_completed=frozenset(self._history.progress.completed),
         ))
 
     def _update_overlay_simple(self, progress: str) -> None:

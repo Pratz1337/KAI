@@ -5,10 +5,12 @@ __all__ = [
     "capture",
     "driver_bridge",
     "elevation",
+    "glass_overlay",
     "history",
     "input_injector",
     "kill_switch",
     "logging_setup",
     "prompt",
+    "voice_input",
     "window_context",
 ]

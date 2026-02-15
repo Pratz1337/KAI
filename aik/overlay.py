@@ -14,6 +14,9 @@ class OverlayState:
     progress: str
     estimated_total_steps: int | None = None
     last_action: str | None = None
+    # Checklist data for the glass overlay progress tracker
+    checklist_tasks: tuple[str, ...] = ()
+    checklist_completed: frozenset[str] = frozenset()
 
 
 class Overlay:

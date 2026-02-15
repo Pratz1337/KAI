@@ -8,14 +8,15 @@ from dotenv import load_dotenv
 
 from aik.agent import AgentConfig, KeyboardVisionAgent
 from aik.anthropic_client import AnthropicClient
+from aik.glass_overlay import GlassOverlay
 from aik.kill_switch import KillSwitch
 from aik.logging_setup import setup_logging
-from aik.overlay import Overlay
+from aik.voice_input import VoiceRecognizer
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="AIK: vision-based desktop automation agent")
-    p.add_argument("--goal", required=True, help="What you want the agent to accomplish.")
+    p.add_argument("--goal", default="", help="What you want the agent to accomplish. If omitted, opens interactive prompt.")
     p.add_argument("--dry-run", action="store_true", help="Print actions but do not inject keys.")
     p.add_argument("--max-steps", type=int, default=60)
     p.add_argument("--interval", type=float, default=0.8, help="Seconds between planning cycles.")
@@ -27,12 +28,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--base-url", default=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
     p.add_argument("--anthropic-version", default=os.getenv("ANTHROPIC_VERSION", "2023-06-01"))
     p.add_argument("--log-level", default=os.getenv("AIK_LOG_LEVEL", "INFO"))
-    p.add_argument("--overlay", action="store_true", help="Show small always-on-top progress overlay.")
-    p.add_argument("--no-overlay", action="store_true", help="Disable overlay.")
+    p.add_argument("--no-overlay", action="store_true", help="Disable the glass overlay.")
+    p.add_argument("--overlay", action="store_true", help="(legacy, overlay is on by default)")
+    p.add_argument("--basic-overlay", action="store_true", help="Use the basic text overlay instead of glass UI.")
     p.add_argument("--memory", default=os.getenv("AIK_MEMORY_PATH", ".aik_memory.json"), help="Path to local agent memory JSON.")
     p.add_argument("--learning", default=os.getenv("AIK_LEARNING_PATH", ".aik_learning.json"), help="Path to learning graph JSON.")
     p.add_argument("--no-driver", action="store_true", help="Disable kernel-driver injection (use SendInput only).")
+    p.add_argument("--voice-provider", choices=["sarvam", "google"], default="sarvam", help="Voice-to-text provider for mic.")
+    p.add_argument("--voice-lang", default="en-IN", help="Comma-separated language codes for voice recognition.")
     return p.parse_args(argv)
+
+
+def _build_voice(args: argparse.Namespace) -> VoiceRecognizer | None:
+    """Create a VoiceRecognizer if credentials are available."""
+    sarvam_key = os.getenv("SARVAM_API_KEY", "").strip()
+    lang_codes = [c.strip() for c in args.voice_lang.split(",") if c.strip()] or ["en-IN"]
+    try:
+        vr = VoiceRecognizer(
+            provider=args.voice_provider,
+            sarvam_api_key=sarvam_key,
+            language_codes=lang_codes,
+        )
+        if vr.available:
+            return vr
+    except Exception:
+        pass
+    return None
 
 
 def main(argv: list[str]) -> int:
@@ -52,8 +73,39 @@ def main(argv: list[str]) -> int:
         anthropic_version=args.anthropic_version,
     )
 
+    ks = KillSwitch()
+    voice = _build_voice(args)
+
+    # Determine overlay type
+    use_overlay = not args.no_overlay
+    use_basic = args.basic_overlay
+
+    goal = args.goal.strip() if args.goal else ""
+
+    if use_overlay and not use_basic:
+        # Glass overlay (default)
+        ov = GlassOverlay(voice=voice, initial_goal=goal)
+        ov.start()
+        ov.set_stop_callback(lambda: ks._triggered.set())
+
+        if not goal:
+            # Interactive mode: wait for user to type/speak a goal
+            print("Glass overlay opened. Enter a goal or use the mic button.")
+            print("Press Ctrl+Alt+Space to toggle overlay visibility.")
+            goal = ov.wait_for_goal()
+            print(f"Goal received: {goal}")
+    elif use_overlay and use_basic:
+        from aik.overlay import Overlay
+        ov = Overlay()
+    else:
+        ov = None
+
+    if not goal:
+        print("No goal provided. Use --goal or the glass overlay prompt.", file=sys.stderr)
+        return 1
+
     cfg = AgentConfig(
-        goal=args.goal,
+        goal=goal,
         dry_run=args.dry_run,
         max_steps=args.max_steps,
         loop_interval_s=args.interval,
@@ -66,11 +118,13 @@ def main(argv: list[str]) -> int:
         use_driver=not args.no_driver,
     )
 
-    enable_overlay = bool(args.overlay) or (not bool(args.no_overlay))
-    ov = Overlay() if enable_overlay else None
-
-    agent = KeyboardVisionAgent(cfg, anthropic=client, kill_switch=KillSwitch(), overlay=ov)
+    agent = KeyboardVisionAgent(cfg, anthropic=client, kill_switch=ks, overlay=ov)
     agent.run()
+
+    # Signal overlay that agent is done
+    if hasattr(ov, "mark_complete"):
+        ov.mark_complete()
+
     return 0
 
 
