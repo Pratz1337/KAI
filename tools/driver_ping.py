@@ -58,9 +58,6 @@ CloseHandle.argtypes = [wintypes.HANDLE]
 CloseHandle.restype = wintypes.BOOL
 
 
-INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
-
-
 def open_device(path: str) -> wintypes.HANDLE:
     h = CreateFileW(
         path,
@@ -71,7 +68,7 @@ def open_device(path: str) -> wintypes.HANDLE:
         FILE_ATTRIBUTE_NORMAL,
         None,
     )
-    if h == INVALID_HANDLE_VALUE:
+    if h == wintypes.HANDLE(-1).value:
         raise ctypes.WinError(ctypes.get_last_error())
     return h
 
@@ -98,9 +95,46 @@ def ioctl(h: wintypes.HANDLE, code: int, in_data: bytes = b"", out_size: int = 2
     return bytes(out_buf[: returned.value])
 
 
+# New IOCTL codes for scancode injection
+IOCTL_AIK_INJECT_SCANCODE = ctl_code(FILE_DEVICE_UNKNOWN, AIK_IOCTL_INDEX + 2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+IOCTL_AIK_INJECT_SCANCODES = ctl_code(FILE_DEVICE_UNKNOWN, AIK_IOCTL_INDEX + 3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+# Scancode flags
+AIK_KEY_DOWN = 0x00
+AIK_KEY_UP = 0x01
+AIK_KEY_EXTENDED = 0x02
+
+
+def test_inject_scancode(h: wintypes.HANDLE, scancode: int, is_down: bool = True, extended: bool = False) -> bool:
+    """Test injecting a single scancode."""
+    import struct
+    flags = AIK_KEY_DOWN if is_down else AIK_KEY_UP
+    if extended:
+        flags |= AIK_KEY_EXTENDED
+    
+    # Pack: USHORT ScanCode, UCHAR Flags
+    data = struct.pack("<HB", scancode, flags)
+    
+    in_buf = (ctypes.c_ubyte * len(data))(*data)
+    returned = wintypes.DWORD(0)
+    
+    ok = DeviceIoControl(
+        h,
+        IOCTL_AIK_INJECT_SCANCODE,
+        ctypes.byref(in_buf),
+        len(data),
+        None,
+        0,
+        ctypes.byref(returned),
+        None,
+    )
+    return bool(ok)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--path", default=r"\\.\AikKmdfIoctl")
+    ap.add_argument("--path", default=r"\\\\.\\AikKmdfIoctl")
+    ap.add_argument("--test-inject", action="store_true", help="Test scancode injection (press 'A')")
     args = ap.parse_args()
 
     h = open_device(args.path)
@@ -111,6 +145,19 @@ def main() -> int:
         msg = b"hello from usermode"
         echo = ioctl(h, IOCTL_AIK_ECHO, msg, 256)
         print("ECHO ->", echo.decode("ascii", errors="replace"))
+        
+        if args.test_inject:
+            print("\nTesting scancode injection...")
+            # 'A' key scancode is 0x1E
+            if test_inject_scancode(h, 0x1E, is_down=True):
+                print("INJECT scancode 0x1E (A) DOWN -> OK")
+            else:
+                print("INJECT scancode 0x1E (A) DOWN -> FAILED")
+            
+            if test_inject_scancode(h, 0x1E, is_down=False):
+                print("INJECT scancode 0x1E (A) UP -> OK")
+            else:
+                print("INJECT scancode 0x1E (A) UP -> FAILED")
     finally:
         CloseHandle(h)
     return 0

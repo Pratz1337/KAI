@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import time
 from ctypes import wintypes
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from .driver_bridge import DriverBridge
+
+log = logging.getLogger("aik.input_injector")
 
 INPUT_KEYBOARD = 1
 
@@ -69,8 +75,31 @@ _MapVirtualKeyW.restype = wintypes.UINT
 
 
 class InputInjector:
-    def __init__(self, *, inter_key_delay_s: float = 0.01) -> None:
+    """
+    Input injection with optional kernel driver support.
+    
+    By default uses user-mode SendInput API. If a DriverBridge is provided
+    and connected, can use kernel-mode injection for bypassing UIPI.
+    """
+    
+    def __init__(
+        self, 
+        *, 
+        inter_key_delay_s: float = 0.01,
+        driver_bridge: "DriverBridge | None" = None,
+        prefer_driver: bool = False,
+    ) -> None:
         self._delay = inter_key_delay_s
+        self._driver = driver_bridge
+        self._prefer_driver = prefer_driver
+        
+        if self._driver and self._prefer_driver:
+            log.info("InputInjector configured with kernel driver preference")
+
+    @property
+    def using_driver(self) -> bool:
+        """Returns True if driver injection is available and preferred."""
+        return self._prefer_driver and self._driver is not None and self._driver.connected
 
     def type_text(self, text: str) -> None:
         for ch in text:
