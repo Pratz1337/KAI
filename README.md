@@ -75,6 +75,18 @@ python main.py --goal "Open Notepad and type Hello World" --dry-run
 python main.py --goal "Type 'Hello World' and press Enter"
 ```
 
+**Elevated mode** (type into admin apps):
+```powershell
+python main.py --elevate --goal "Type: Hello from elevated context"
+```
+
+Note: Elevation still cannot interact with the UAC secure desktop or login screen.
+
+**Interactive terminal mode** (re-enter goals without retyping full command):
+```powershell
+python tools/interactive_run.py
+```
+
 ## Command-line Options
 
 | Option | Default | Description |

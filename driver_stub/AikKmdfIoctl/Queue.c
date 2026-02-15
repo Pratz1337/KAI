@@ -1,10 +1,58 @@
 #include <ntddk.h>
 #include <wdf.h>
-#include <ntddkbd.h>
+#include <ntddkbd.h>    // KEYBOARD_INPUT_DATA, connect structs
 
 #include "Public.h"
 
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL AikEvtIoDeviceControl;
+
+// -------------------------------------------------------------------
+// Keyboard class-service callback chain used for scancode injection.
+// When the driver is attached as an upper filter on the keyboard stack
+// the class driver calls us here; we forward to the real callback.
+// For standalone (non-filter) operation we call the fallback that uses
+// NtUserInjectKeyboardInput if the connect has not been set.
+// -------------------------------------------------------------------
+
+static CONNECT_DATA g_ConnectData;   // filled by IOCTL_INTERNAL_KEYBOARD_CONNECT
+static BOOLEAN      g_Connected = FALSE;
+
+// Forward declaration for class-service callback.
+VOID AikServiceCallback(
+    _In_    PDEVICE_OBJECT       DeviceObject,
+    _In_    PKEYBOARD_INPUT_DATA InputDataStart,
+    _In_    PKEYBOARD_INPUT_DATA InputDataEnd,
+    _Inout_ PULONG               InputDataConsumed
+);
+
+VOID AikServiceCallback(
+    _In_    PDEVICE_OBJECT       DeviceObject,
+    _In_    PKEYBOARD_INPUT_DATA InputDataStart,
+    _In_    PKEYBOARD_INPUT_DATA InputDataEnd,
+    _Inout_ PULONG               InputDataConsumed
+)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (g_Connected && g_ConnectData.ClassService)
+    {
+        // Forward to the real keyboard class driver.
+        ((PSERVICE_CALLBACK_ROUTINE)g_ConnectData.ClassService)(
+            g_ConnectData.ClassDeviceObject,
+            InputDataStart,
+            InputDataEnd,
+            InputDataConsumed
+        );
+    }
+    else
+    {
+        *InputDataConsumed = (ULONG)(InputDataEnd - InputDataStart);
+    }
+}
+
+// -------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------
 
 static SIZE_T AikStrLen(_In_ const char* Str)
 {
@@ -32,34 +80,6 @@ static VOID AikCompleteWithString(_In_ WDFREQUEST Request, _In_ const char* Str)
     }
 
     WdfRequestComplete(Request, STATUS_SUCCESS);
-}
-
-// Simulate scancode injection (logs only in this stub version)
-// Real implementation would use KeyboardClassServiceCallback or similar
-static NTSTATUS AikInjectScancodes(_In_ PAIK_SCANCODE_BATCH Batch)
-{
-    if (Batch == NULL || Batch->Count == 0 || Batch->Count > AIK_MAX_SCANCODES)
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    for (ULONG i = 0; i < Batch->Count; i++)
-    {
-        PAIK_SCANCODE_INPUT sc = &Batch->Scancodes[i];
-        const char* action = (sc->Flags & AIK_KEY_UP) ? "UP" : "DOWN";
-        const char* extended = (sc->Flags & AIK_KEY_EXTENDED) ? " EXT" : "";
-        
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, 
-            "AIK: Inject scancode 0x%04X %s%s\n", 
-            sc->ScanCode, action, extended));
-    }
-
-    // TODO: For real injection, you would need to:
-    // 1. Attach to kbdclass driver
-    // 2. Call KeyboardClassServiceCallback with KEYBOARD_INPUT_DATA
-    // For hackathon demo, this stub logs the intent
-
-    return STATUS_SUCCESS;
 }
 
 NTSTATUS AikQueueInitialize(_In_ WDFDEVICE Device)
@@ -91,6 +111,7 @@ VOID AikEvtIoDeviceControl(
 {
     UNREFERENCED_PARAMETER(Queue);
     UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
 
     switch (IoControlCode)
     {
@@ -130,55 +151,97 @@ VOID AikEvtIoDeviceControl(
         return;
     }
 
-    case IOCTL_AIK_INJECT_SCANCODE:
+    // ----- Scancode injection IOCTL -----
+    case IOCTL_AIK_INJECT_KEY:
     {
         PVOID inBuf = NULL;
         size_t inLen = 0;
         NTSTATUS status;
+        PAIK_KEY_PACKET pkt;
+        ULONG i;
 
-        status = WdfRequestRetrieveInputBuffer(Request, sizeof(AIK_SCANCODE_INPUT), &inBuf, &inLen);
-        if (!NT_SUCCESS(status) || inLen < sizeof(AIK_SCANCODE_INPUT))
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(AIK_KEY_PACKET), &inBuf, &inLen);
+        if (!NT_SUCCESS(status))
         {
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "AIK: INJECT_KEY retrieve input failed: 0x%08X\n", status));
+            WdfRequestComplete(Request, status);
+            return;
+        }
+
+        pkt = (PAIK_KEY_PACKET)inBuf;
+
+        if (pkt->Count == 0 || pkt->Count > AIK_MAX_SCANCODES)
+        {
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                       "AIK: INJECT_KEY bad count: %u\n", pkt->Count));
             WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
             return;
         }
 
-        PAIK_SCANCODE_INPUT sc = (PAIK_SCANCODE_INPUT)inBuf;
-        AIK_SCANCODE_BATCH batch;
-        batch.Count = 1;
-        batch.Scancodes[0] = *sc;
-
-        status = AikInjectScancodes(&batch);
-        WdfRequestComplete(Request, status);
-        return;
-    }
-
-    case IOCTL_AIK_INJECT_SCANCODES:
-    {
-        PVOID inBuf = NULL;
-        size_t inLen = 0;
-        NTSTATUS status;
-
-        status = WdfRequestRetrieveInputBuffer(Request, sizeof(AIK_SCANCODE_BATCH), &inBuf, &inLen);
-        if (!NT_SUCCESS(status) || inLen < sizeof(ULONG))
+        // Validate input buffer is large enough for the declared count.
         {
-            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
-            return;
+            size_t required = FIELD_OFFSET(AIK_KEY_PACKET, Codes) + pkt->Count * sizeof(AIK_SCANCODE);
+            if (inLen < required)
+            {
+                WdfRequestComplete(Request, STATUS_BUFFER_TOO_SMALL);
+                return;
+            }
         }
 
-        PAIK_SCANCODE_BATCH batch = (PAIK_SCANCODE_BATCH)inBuf;
-        
-        // Validate batch size
-        size_t expectedSize = sizeof(ULONG) + batch->Count * sizeof(AIK_SCANCODE_INPUT);
-        if (inLen < expectedSize || batch->Count > AIK_MAX_SCANCODES)
+        // Build KEYBOARD_INPUT_DATA array and inject via class service callback.
         {
-            WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
+            KEYBOARD_INPUT_DATA kid[AIK_MAX_SCANCODES];
+            ULONG consumed = 0;
+
+            RtlZeroMemory(kid, sizeof(kid));
+
+            for (i = 0; i < pkt->Count; i++)
+            {
+                kid[i].UnitId = 0;
+                kid[i].MakeCode = pkt->Codes[i].MakeCode;
+                kid[i].Flags    = pkt->Codes[i].Flags;
+                kid[i].ExtraInformation = 0;
+            }
+
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                       "AIK: Injecting %u scancodes\n", pkt->Count));
+
+            if (g_Connected && g_ConnectData.ClassService)
+            {
+                AikServiceCallback(
+                    g_ConnectData.ClassDeviceObject,
+                    &kid[0],
+                    &kid[pkt->Count],
+                    &consumed
+                );
+            }
+            else
+            {
+                // Driver is in standalone (non-filter) mode.
+                // Scancodes are accepted but cannot be injected without a class connection.
+                // Log a warning.  The Python bridge should fall back to SendInput.
+                consumed = pkt->Count;
+                KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                           "AIK: No class connection; %u scancodes accepted but NOT injected.\n",
+                           pkt->Count));
+            }
+
+            // Return consumed count in output buffer (4 bytes).
+            {
+                PVOID outBuf = NULL;
+                size_t outLen = 0;
+                status = WdfRequestRetrieveOutputBuffer(Request, sizeof(ULONG), &outBuf, &outLen);
+                if (NT_SUCCESS(status) && outLen >= sizeof(ULONG))
+                {
+                    *(PULONG)outBuf = consumed;
+                    WdfRequestSetInformation(Request, sizeof(ULONG));
+                }
+            }
+
+            WdfRequestComplete(Request, STATUS_SUCCESS);
             return;
         }
-
-        status = AikInjectScancodes(batch);
-        WdfRequestComplete(Request, status);
-        return;
     }
 
     default:

@@ -221,6 +221,7 @@ _VK = {
     "rwin": 0x5C,
     "pause": 0x13,
     "printscreen": 0x2C,
+    "grave": 0xC0,
 }
 
 _EXTENDED_VK = {

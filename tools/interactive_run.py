@@ -12,6 +12,11 @@ from dotenv import load_dotenv
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Interactive terminal launcher for AIK")
     p.add_argument("--python", default=sys.executable, help="Python executable to use")
+    p.add_argument(
+        "--elevate",
+        action="store_true",
+        help="Pass --elevate to main.py (will trigger UAC if not already elevated).",
+    )
     p.add_argument("--max-steps", type=int, default=20)
     p.add_argument("--interval", type=float, default=0.6)
     p.add_argument("--monitor", type=int, default=1)
@@ -45,6 +50,8 @@ def build_command(args: argparse.Namespace, goal: str, dry_run: bool) -> list[st
         "--log-level",
         args.log_level,
     ]
+    if args.elevate:
+        cmd.append("--elevate")
     if dry_run:
         cmd.append("--dry-run")
     return cmd

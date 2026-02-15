@@ -4,10 +4,10 @@ __all__ = [
     "anthropic_client",
     "capture",
     "driver_bridge",
+    "elevation",
     "input_injector",
     "kill_switch",
     "logging_setup",
     "prompt",
     "window_context",
 ]
-

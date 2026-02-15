@@ -26,6 +26,8 @@ class AgentConfig:
     screenshot_max_width: int | None = 1280
     dry_run: bool = False
     inter_key_delay_s: float = 0.01
+    kernel_mode: bool = False
+    driver_path: str = r"\\.\AikKmdfIoctl"
 
 
 @dataclass
@@ -47,7 +49,18 @@ class KeyboardVisionAgent:
         self._capturer = ScreenCapturer(
             monitor_index=cfg.monitor_index, max_width=cfg.screenshot_max_width
         )
-        self._injector = InputInjector(inter_key_delay_s=cfg.inter_key_delay_s)
+
+        if cfg.kernel_mode:
+            from .input_injector_kernel import KernelInputInjector
+            log.info("Using KERNEL-MODE injector (driver: %s)", cfg.driver_path)
+            self._injector = KernelInputInjector(
+                inter_key_delay_s=cfg.inter_key_delay_s,
+                device_path=cfg.driver_path,
+                fallback=True,
+            )
+        else:
+            self._injector = InputInjector(inter_key_delay_s=cfg.inter_key_delay_s)
+
         self._state = AgentState()
 
     def run(self) -> None:
