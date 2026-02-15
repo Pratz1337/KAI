@@ -32,7 +32,14 @@ class ScreenCapturer:
                 f"Valid range is 1..{len(monitors) - 1}."
             )
 
-        mon = monitors[self._monitor_index]
+        mon = dict(monitors[self._monitor_index])
+        # mss uses monitors[0] as the virtual screen bounding box.
+        vmon = monitors[0] if monitors else None
+        if isinstance(vmon, dict):
+            mon["__virtual_screen_left"] = int(vmon.get("left", 0))
+            mon["__virtual_screen_top"] = int(vmon.get("top", 0))
+            mon["__virtual_screen_width"] = int(vmon.get("width", 0))
+            mon["__virtual_screen_height"] = int(vmon.get("height", 0))
         shot = self._sct.grab(mon)
         png = mss.tools.to_png(shot.rgb, shot.size)
 
@@ -45,7 +52,7 @@ class ScreenCapturer:
             width=width,
             height=height,
             monitor_index=self._monitor_index,
-            monitor=dict(mon),
+            monitor=mon,
         )
 
 

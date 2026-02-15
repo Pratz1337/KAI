@@ -1,0 +1,75 @@
+{
+  "successes": [
+    {
+      "app": "gmail",
+      "goal": "open chrome go to my mail send a mail to kamalkarteek1@gmail.com the message i want u to send is hellooo",
+      "actions": [
+        {
+          "type": "mouse_click",
+          "x": 560,
+          "y": 140,
+          "button": "left",
+          "clicks": 1
+        },
+        {
+          "type": "wait_ms",
+          "ms": 1000
+        },
+        {
+          "type": "mouse_click",
+          "x": 1020,
+          "y": 381,
+          "button": "left",
+          "clicks": 1
+        },
+        {
+          "type": "type_text",
+          "text": "kamalkarteek1@gmail.com"
+        },
+        {
+          "type": "key_press",
+          "key": "tab"
+        },
+        {
+          "type": "key_press",
+          "key": "tab"
+        },
+        {
+          "type": "mouse_click",
+          "x": 1020,
+          "y": 450,
+          "button": "left",
+          "clicks": 1
+        },
+        {
+          "type": "type_text",
+          "text": "hellooo"
+        },
+        {
+          "type": "mouse_click",
+          "x": 897,
+          "y": 691,
+          "button": "left",
+          "clicks": 1
+        },
+        {
+          "type": "wait_ms",
+          "ms": 2000
+        },
+        {
+          "type": "mouse_click",
+          "x": 749,
+          "y": 680,
+          "button": "left",
+          "clicks": 1
+        },
+        {
+          "type": "stop",
+          "reason": "Email successfully sent to kamalkarteek1@gmail.com with message 'hellooo'. The 'Message sent' notification confirms the action is complete."
+        }
+      ],
+      "note": "Completed: open chrome go to my mail send a mail to kamalkarteek1@gmail.com the message i want u to send is hellooo",
+      "ts": 1771144504
+    }
+  ]
+}

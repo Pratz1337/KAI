@@ -10,42 +10,28 @@ from aik.agent import AgentConfig, KeyboardVisionAgent
 from aik.anthropic_client import AnthropicClient
 from aik.kill_switch import KillSwitch
 from aik.logging_setup import setup_logging
+from aik.overlay import Overlay
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="AIK: vision-based keyboard automation (user-mode)")
+    p = argparse.ArgumentParser(description="AIK: vision-based desktop automation agent")
     p.add_argument("--goal", required=True, help="What you want the agent to accomplish.")
     p.add_argument("--dry-run", action="store_true", help="Print actions but do not inject keys.")
-    p.add_argument(
-        "--elevate",
-        action="store_true",
-        help="Relaunch as Administrator via UAC prompt if not already elevated.",
-    )
-    p.add_argument(
-        "--require-admin",
-        action="store_true",
-        help="Exit with an error if not running as Administrator.",
-    )
-    p.add_argument("--max-steps", type=int, default=40)
+    p.add_argument("--max-steps", type=int, default=60)
     p.add_argument("--interval", type=float, default=0.8, help="Seconds between planning cycles.")
     p.add_argument("--monitor", type=int, default=1, help="mss monitor index (1=primary).")
     p.add_argument("--screenshot-max-width", type=int, default=1280)
-    p.add_argument("--max-tokens", type=int, default=700)
+    p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--temperature", type=float, default=0.2)
-    p.add_argument("--model", default=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20240620"))
+    p.add_argument("--model", default=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"))
     p.add_argument("--base-url", default=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
     p.add_argument("--anthropic-version", default=os.getenv("ANTHROPIC_VERSION", "2023-06-01"))
     p.add_argument("--log-level", default=os.getenv("AIK_LOG_LEVEL", "INFO"))
-    p.add_argument(
-        "--kernel",
-        action="store_true",
-        help="Use kernel-mode driver for keystroke injection (bypasses UIPI/UAC).",
-    )
-    p.add_argument(
-        "--driver-path",
-        default=os.getenv("AIK_DRIVER_PATH", r"\\.\AikKmdfIoctl"),
-        help="Device path for the kernel driver.",
-    )
+    p.add_argument("--overlay", action="store_true", help="Show small always-on-top progress overlay.")
+    p.add_argument("--no-overlay", action="store_true", help="Disable overlay.")
+    p.add_argument("--memory", default=os.getenv("AIK_MEMORY_PATH", ".aik_memory.json"), help="Path to local agent memory JSON.")
+    p.add_argument("--learning", default=os.getenv("AIK_LEARNING_PATH", ".aik_learning.json"), help="Path to learning graph JSON.")
+    p.add_argument("--no-driver", action="store_true", help="Disable kernel-driver injection (use SendInput only).")
     return p.parse_args(argv)
 
 
@@ -53,25 +39,6 @@ def main(argv: list[str]) -> int:
     load_dotenv()
     args = parse_args(argv)
     setup_logging(args.log_level)
-
-    if args.elevate or args.require_admin:
-        from aik.elevation import is_admin, relaunch_as_admin
-
-        if not is_admin():
-            if args.require_admin and not args.elevate:
-                print(
-                    "This command must be run as Administrator.\n"
-                    "Re-run your terminal as Admin, or pass --elevate to trigger a UAC prompt.",
-                    file=sys.stderr,
-                )
-                return 3
-
-            try:
-                relaunch_as_admin(argv=sys.argv)
-            except Exception as e:
-                print(f"Failed to elevate: {e}", file=sys.stderr)
-                return 4
-            return 0
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
@@ -94,11 +61,15 @@ def main(argv: list[str]) -> int:
         screenshot_max_width=args.screenshot_max_width,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
-        kernel_mode=args.kernel,
-        driver_path=args.driver_path,
+        memory_path=args.memory,
+        learning_path=args.learning,
+        use_driver=not args.no_driver,
     )
 
-    agent = KeyboardVisionAgent(cfg, anthropic=client, kill_switch=KillSwitch())
+    enable_overlay = bool(args.overlay) or (not bool(args.no_overlay))
+    ov = Overlay() if enable_overlay else None
+
+    agent = KeyboardVisionAgent(cfg, anthropic=client, kill_switch=KillSwitch(), overlay=ov)
     agent.run()
     return 0
 

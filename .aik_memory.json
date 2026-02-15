@@ -1,0 +1,9 @@
+{
+  "events": [
+    {
+      "type": "stop",
+      "reason": "Email successfully sent to kamalkarteek1@gmail.com with message 'hellooo'. The 'Message sent' notification confirms the action is complete.",
+      "ts": 1771144504
+    }
+  ]
+}

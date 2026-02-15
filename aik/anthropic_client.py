@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import random
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -72,10 +74,36 @@ class AnthropicClient:
         }
 
         url = f"{self._base_url}/v1/messages"
-        with httpx.Client(timeout=self._timeout_s) as client:
-            resp = client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        last_exc: Exception | None = None
+
+        # Hackathon-friendly retries for transient 429/5xx.
+        for attempt in range(1, 6):
+            try:
+                with httpx.Client(timeout=self._timeout_s) as client:
+                    resp = client.post(url, headers=headers, json=payload)
+
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    retry_after = resp.headers.get("retry-after")
+                    if retry_after and str(retry_after).strip().isdigit():
+                        sleep_s = float(int(str(retry_after).strip()))
+                    else:
+                        # Exponential backoff with jitter.
+                        sleep_s = min(20.0, (2 ** (attempt - 1)) * 0.8) + random.random() * 0.4
+                    if attempt >= 5:
+                        resp.raise_for_status()
+                    time.sleep(sleep_s)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                last_exc = e
+                if attempt >= 5:
+                    raise
+                time.sleep(min(10.0, attempt * 0.7) + random.random() * 0.3)
+        else:
+            raise last_exc or RuntimeError("Anthropic request failed")
 
         text = _extract_text(data)
         return AnthropicResponse(raw=data, text=text)
